@@ -75,8 +75,13 @@ Intensity scale:
 Preprint available on arXiv: *(link coming soon)*
 
 ```bibtex
-@article{quellec2026clsm,
-  title={Constrained latent state modeling: A unifying perspective on representation learning under competing constraints},
-  author={Quellec, Gwenol{\'e}},
-  year={2026}
+@misc{quellec2026clsm,
+      title={Constrained latent state modeling: A unifying perspective on representation learning under competing constraints}, 
+      author={Gwenol\'e Quellec},
+      year={2026},
+      eprint={2605.15995},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.15995}, 
 }
+```
