@@ -112,4 +112,4 @@ For example:
 
 **Constrained latent state modeling: A unifying perspective on representation learning under competing constraints**
 
-Preprint available on arXiv: *(link coming soon)*
+Preprint available on arXiv: [arXiv:2605.15995](https://arxiv.org/abs/2605.15995)
