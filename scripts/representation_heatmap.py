@@ -13,7 +13,12 @@ performance (higher is better).
 Example
 --------
 
-    python -m scripts.representation_heatmap --output representation_heatmap.pdf
+    python -m scripts.representation_heatmap \
+        --output representation_heatmap.pdf
+    
+    python -m scripts.representation_heatmap \
+        --output representation_heatmap.pdf \
+        --metrics paper
 """
 
 from __future__ import annotations
@@ -67,97 +72,84 @@ PRESETS = {
     ),
 }
 
-# The third element indicates whether larger values are preferable.
-# The order matches the evaluation-metrics section of the manuscript.
-METRICS = {
-    "Observation\nrecons-\ntruction MSE ↓": (
-        "test",
-        "observation_mse",
-        False,
-    ),
-    "Observation\nrollout MSE\n(h=5) ↓": (
-        "test",
-        "rollout_observation_mse_h5",
-        False,
-    ),
-    "Latent\nrollout MSE\n(h=5) ↓": (
-        "test",
-        "rollout_latent_mse_h5",
-        False,
-    ),
-    "State\nprobe\n$R^2$ ↑": (
-        "test",
-        "state_probe_r2",
-        True,
-    ),
-    "State\nCCA ↑": (
-        "test",
-        "state_cca_mean_correlation",
-        True,
-    ),
-    "State\nlinearity\ngap ↓": (
-        "test",
-        "state_linearity_gap",
-        False,
-    ),
-    "Neighbor-\nhood trust\nworthiness ↑": (
-        "test",
-        "neighborhood_trustworthiness",
-        True,
-    ),
-    "Counter-\nfactual\nNMSE ↓": (
-        "test",
-        "counterfactual_normalized_mse",
-        False,
-    ),
-    "Conditional\nnuisance\naccuracy ↓": (
-        "test",
-        "conditional_nuisance_probe_accuracy",
-        False,
-    ),
+
+ALL_METRICS = {
+    "observation_mse": {
+        "label": "Observation\nrecons-\ntruction MSE ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: f"{x:.3f}\nMSE",
+    },
+    "rollout_observation_mse_h5": {
+        "label": "Observation\nrollout MSE\n(h=5) ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: f"{x:.3f}\nMSE",
+    },
+    "rollout_latent_mse_h5": {
+        "label": "Latent\nrollout MSE\n(h=5) ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: f"{x:.3f}\nMSE",
+    },
+    "state_probe_r2": {
+        "label": "State\nprobe\n$R^2$ ↑",
+        "split": "test",
+        "higher_is_better": True,
+        "formatter": lambda x: f"{x:.3f}\n$R^2$",
+    },
+    "state_cca_mean_correlation": {
+        "label": "State\nCCA ↑",
+        "split": "test",
+        "higher_is_better": True,
+        "formatter": lambda x: f"{x:.3f}\nmean $\\rho$",
+    },
+    "state_linearity_gap": {
+        "label": "State\nlinearity\ngap ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: (
+            f"{x:.3f}\n$\\Delta_{{\\mathrm{{lin}}}}$"
+        ),
+    },
+    "neighborhood_trustworthiness": {
+        "label": "Neighbor-\nhood trust\nworthiness ↑",
+        "split": "test",
+        "higher_is_better": True,
+        "formatter": lambda x: f"{x:.3f}\nscore",
+    },
+    "counterfactual_normalized_mse": {
+        "label": "Counter-\nfactual\nNMSE ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: f"{x:.4f}\nNMSE",
+    },
+    "conditional_nuisance_probe_accuracy": {
+        "label": "Conditional\nnuisance\naccuracy ↓",
+        "split": "test",
+        "higher_is_better": False,
+        "formatter": lambda x: f"{100.0 * x:.1f}%\naccuracy",
+    },
 }
 
 
-# =============================================================================
-# Metric formatting
-# =============================================================================
-
-def format_raw_value(
-    property_name: str,
-    value: float,
-) -> str:
-    """Format original metric values with meaningful units."""
-
-    if property_name == "Observation\nrecons-\ntruction MSE ↓":
-        return f"{value:.3f}\nMSE"
-
-    if property_name == "Observation\nrollout MSE\n(h=5) ↓":
-        return f"{value:.3f}\nMSE"
-
-    if property_name == "Latent\nrollout MSE\n(h=5) ↓":
-        return f"{value:.3f}\nMSE"
-
-    if property_name == "State\nprobe\n$R^2$ ↑":
-        return f"{value:.3f}\n$R^2$"
-
-    if property_name == "State\nCCA ↑":
-        return f"{value:.3f}\nmean $\\rho$"
-
-    if property_name == "State\nlinearity\ngap ↓":
-        return f"{value:.3f}\n$\\Delta_{{\\mathrm{{lin}}}}$"
-
-    if property_name == "Neighbor-\nhood trust\nworthiness ↑":
-        return f"{value:.3f}\nscore"
-
-    if property_name == "Counter-\nfactual\nNMSE ↓":
-        return f"{value:.4f}\nNMSE"
-
-    if property_name == "Conditional\nnuisance\naccuracy ↓":
-        return f"{100.0 * value:.1f}%\naccuracy"
-
-    raise KeyError(
-        f"Unknown metric: {property_name}"
-    )
+PAPER_METRICS = {
+    "rollout_observation_mse_h5": {
+        "label": "Prediction MSE ↓",
+    },
+    "state_probe_r2": {
+        "label": "State\naccessibility ↑",
+    },
+    "neighborhood_trustworthiness": {
+        "label": "Neighborhood\npreservation ↑",
+    },
+    "counterfactual_normalized_mse": {
+        "label": "Counterfactual\nconsistency ↑",
+    },
+    "conditional_nuisance_probe_accuracy": {
+        "label": "Nuisance\nsuppression ↑",
+    },
+}
 
 
 # =============================================================================
@@ -227,10 +219,26 @@ def main() -> None:
         default="representation_heatmap.pdf",
         help="Output PDF file."
     )
+    parser.add_argument(
+        "--metrics",
+        choices=("all", "paper"),
+        default="all",
+        help="Subset of metrics to display.",
+    )
     args = parser.parse_args()
 
+    if args.metrics == "all":
+        metrics = ALL_METRICS
+    else:
+        metrics = {
+            key: {
+                **ALL_METRICS[key],
+                **PAPER_METRICS[key],
+            }
+            for key in PAPER_METRICS
+        }
     values = np.zeros(
-        (len(PRESETS), len(METRICS)),
+        (len(PRESETS), len(metrics)),
         dtype=float,
     )
 
@@ -252,20 +260,15 @@ def main() -> None:
         ) as stream:
             data = json.load(stream)
 
-        for metric_index, (
-            _display_name,
-            (
-                split,
-                metric_name,
-                _higher_is_better,
-            ),
-        ) in enumerate(METRICS.items()):
+        for metric_index, (metric_name, metric) in enumerate(
+            metrics.items()
+        ):
             values[
                 preset_index,
                 metric_index,
             ] = read_aggregate_mean(
                 data,
-                split=split,
+                split=metric["split"],
                 metric=metric_name,
             )
 
@@ -275,14 +278,9 @@ def main() -> None:
 
     normalized = np.zeros_like(values)
 
-    for metric_index, (
-        _display_name,
-        (
-            _split,
-            _metric_name,
-            higher_is_better,
-        ),
-    ) in enumerate(METRICS.items()):
+    for metric_index, metric in enumerate(
+        metrics.values()
+    ):
         column = values[:, metric_index]
 
         minimum = float(np.min(column))
@@ -293,7 +291,7 @@ def main() -> None:
             normalized[:, metric_index] = 1.0
             continue
 
-        if higher_is_better:
+        if metric["higher_is_better"]:
             normalized[:, metric_index] = (
                 column - minimum
             ) / value_range
@@ -306,7 +304,10 @@ def main() -> None:
     # Build the heatmap    
     # -------------------------------------------------------------------------
 
-    column_labels = list(METRICS.keys())
+    column_labels = [
+        metric["label"]
+        for metric in metrics.values()
+    ]
 
     figure, axis = plt.subplots(
         figsize=(12.5, 8),
@@ -344,7 +345,9 @@ def main() -> None:
     )
 
     for row_index, preset_name in enumerate(PRESETS):
-        for column_index, property_name in enumerate(METRICS.keys()):
+        for column_index, metric in enumerate(
+            metrics.values()
+        ):
             normalized_value = normalized[
                 row_index,
                 column_index,
@@ -364,10 +367,7 @@ def main() -> None:
             axis.text(
                 column_index,
                 row_index,
-                format_raw_value(
-                    property_name,
-                    raw_value,
-                ),
+                metric["formatter"](raw_value),
                 horizontalalignment="center",
                 verticalalignment="center",
                 color=text_color,

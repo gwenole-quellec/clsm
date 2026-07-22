@@ -54,6 +54,27 @@ from clsm.utils import module_command, print_banner, print_separator
 
 
 # =============================================================================
+# Sweep data structures
+# =============================================================================
+
+@dataclass(frozen=True)
+class SweepWeights:
+    predictive: float
+    minimality: float
+    temporal: float
+    observation: float
+    invariance: float
+    structural: float
+
+
+@dataclass(frozen=True)
+class WeightRange:
+    minimum: float
+    maximum: float
+    zero_probability: float = 0.0
+
+
+# =============================================================================
 # Sweep constants
 # =============================================================================
 
@@ -119,27 +140,6 @@ ANCHOR_CONFIGURATIONS = (
     SweepWeights(1.0, 0.0, 0.5, 0.5, 0.0, 0.0),
     SweepWeights(1.0, 0.01, 0.5, 0.5, 0.1, 0.1),
 )
-
-
-# =============================================================================
-# Sweep data structures
-# =============================================================================
-
-@dataclass(frozen=True)
-class SweepWeights:
-    predictive: float
-    minimality: float
-    temporal: float
-    observation: float
-    invariance: float
-    structural: float
-
-
-@dataclass(frozen=True)
-class WeightRange:
-    minimum: float
-    maximum: float
-    zero_probability: float = 0.0
 
 
 # =============================================================================
