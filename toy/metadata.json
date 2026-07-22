@@ -1,0 +1,11 @@
+{
+  "state_names": ["x", "y", "vx", "vy"],
+  "state_labels": ["$x$", "$y$", "$v_x$", "$v_y$"],
+  "observation_labels": [
+    "Observed feature 0",
+    "Observed feature 1"
+  ],
+  "latent_names": ["z_0", "z_1", "z_2", "z_3"],
+  "latent_labels": ["$z_0$", "$z_1$", "$z_2$", "$z_3$"],
+  "environment_color_by": "x"
+}

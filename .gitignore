@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated data
+data/
+runs/
+figures/
+
+# Models
+*.pt
+
+# NumPy archives
+*.npz
+
+# macOS / Linux
+.DS_Store
