@@ -1,13 +1,15 @@
 """
-Run a large-scale CLSM weight sweep and analyze the resulting Pareto frontier.
+Run a large-scale CLSM weight sweep and analyze all pairwise 2-D Pareto fronts.
 
 Author: Gwenolé Quellec
 Year: 2026
 
-This script samples CLSM constraint weights, trains and evaluates each
-configuration, identifies the nine-dimensional Pareto-optimal set, and
-generates summary figures illustrating the trade-offs between representation
-properties and the influence of individual constraint weights.
+The script samples CLSM constraint weights, trains and evaluates each
+configuration, aggregates results across model seeds, and generates the four
+pairwise Pareto curves retained for the paper induced by the five paper metrics. Pareto-optimal
+configurations receive stable global labels (P1, P2, ...) shared by all figures.
+
+Requires ``adjustText`` for automatic label placement.
 
 Examples
 --------
@@ -18,17 +20,17 @@ Run a complete sweep:
         --num-configurations 100 \
         --device cuda
 
+Rebuild the aggregate analysis from existing per-run evaluations:
+
     python -m scripts.constraint_sweep \
         --train-module toy.train \
         --analyze-only
 
+Regenerate the ten pairwise Pareto figures from saved aggregate results:
+
     python -m scripts.constraint_sweep \
         --train-module toy.train \
         --figures-only
-
-Outputs are written to ``runs/constraint-sweep-analysis/`` and include the sweep
-manifest, aggregated results, Pareto-optimal configurations, and analysis
-figures.
 """
 
 from __future__ import annotations
@@ -37,17 +39,13 @@ import argparse
 import csv
 import json
 import subprocess
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
-from matplotlib.patches import FancyArrowPatch
-from scipy.stats import spearmanr
+from adjustText import adjust_text
 from tqdm.auto import tqdm
 
 from clsm.utils import module_command, print_banner, print_separator
@@ -87,49 +85,59 @@ WEIGHT_NAMES = (
     "structural",
 )
 
-# True means that larger values are preferable
+# True means that larger values are preferable.
 OBJECTIVES = {
-    "observation_mse": False,
     "rollout_observation_mse_h5": False,
-    "rollout_latent_mse_h5": False,
     "state_probe_r2": True,
-    "state_cca_mean_correlation": True,
-    "state_linearity_gap": False,
     "neighborhood_trustworthiness": True,
     "counterfactual_normalized_mse": False,
     "conditional_nuisance_probe_accuracy": False,
 }
 
-DEFAULT_PROJECTIONS = (
+OBJECTIVE_LABELS = {
+    "rollout_observation_mse_h5": "Prediction MSE (h=5) ↓",
+    "state_probe_r2": r"State accessibility ($R^2$) ↑",
+    "neighborhood_trustworthiness": "Neighborhood preservation ↑",
+    "counterfactual_normalized_mse": "Counterfactual NMSE ↓",
+    "conditional_nuisance_probe_accuracy": "Conditional nuisance accuracy ↓",
+}
+
+OBJECTIVE_SHORT_NAMES = {
+    "rollout_observation_mse_h5": "prediction",
+    "state_probe_r2": "state_accessibility",
+    "neighborhood_trustworthiness": "neighborhood_preservation",
+    "counterfactual_normalized_mse": "counterfactual_consistency",
+    "conditional_nuisance_probe_accuracy": "nuisance_suppression",
+}
+
+# Pairwise Pareto fronts retained for the paper.
+# The order determines the output numbering and the panel order A--D.
+OBJECTIVE_PAIRS = (
     (
-        "state_probe_r2",
-        "counterfactual_normalized_mse",
         "rollout_observation_mse_h5",
+        "counterfactual_normalized_mse",
     ),
     (
-        "state_cca_mean_correlation",
+        "rollout_observation_mse_h5",
         "conditional_nuisance_probe_accuracy",
-        "neighborhood_trustworthiness",
     ),
     (
-        "rollout_observation_mse_h5",
+        "neighborhood_trustworthiness",
+        "conditional_nuisance_probe_accuracy",
+    ),
+    (
         "state_probe_r2",
-        "counterfactual_normalized_mse",
-    ),
-    (
-        "state_linearity_gap",
         "neighborhood_trustworthiness",
-        "state_cca_mean_correlation",
     ),
 )
 
 WEIGHT_RANGES = {
-    "predictive":  WeightRange(0.05, 2.0, 0.05),
-    "minimality":  WeightRange(1e-5, 5e-2, 0.25),
-    "temporal":    WeightRange(0.01, 1.5, 0.10),
+    "predictive": WeightRange(0.05, 2.0, 0.05),
+    "minimality": WeightRange(1e-5, 5e-2, 0.25),
+    "temporal": WeightRange(0.01, 1.5, 0.10),
     "observation": WeightRange(0.01, 1.5, 0.10),
-    "invariance":  WeightRange(1e-3, 2e-1, 0.20),
-    "structural":  WeightRange(1e-3, 2e-1, 0.20),
+    "invariance": WeightRange(1e-3, 2e-1, 0.20),
+    "structural": WeightRange(1e-3, 2e-1, 0.20),
 }
 
 ANCHOR_CONFIGURATIONS = (
@@ -178,8 +186,8 @@ def sample_weights(rng: np.random.Generator) -> SweepWeights:
         for name, weight_range in WEIGHT_RANGES.items()
     }
 
-    # Minimality, invariance, and structural regularization are not useful
-    # without at least one information-preserving objective
+    # Regularization-only objectives are not useful without at least one
+    # information-preserving objective.
     if (
         sampled["predictive"]
         + sampled["temporal"]
@@ -339,6 +347,7 @@ def save_records(
     json_path: Path,
     csv_path: Path,
 ) -> None:
+    """Save a sequence of flat records to JSON and CSV."""
     json_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -369,6 +378,7 @@ def save_records(
 
 
 def load_test_objectives(metrics_path: Path) -> dict[str, float]:
+    """Load the five paper metrics from one evaluation file."""
     with metrics_path.open("r", encoding="utf-8") as stream:
         payload = json.load(stream)
 
@@ -396,34 +406,44 @@ def load_test_objectives(metrics_path: Path) -> dict[str, float]:
 
 
 def load_configuration_results(output_dir: Path) -> list[dict[str, object]]:
-    """Load previously aggregated and Pareto-annotated sweep results."""
+    """Load previously aggregated sweep results."""
     path = output_dir / "sweep_configuration_results.json"
     if not path.exists():
         raise FileNotFoundError(
             "Cannot generate figures because aggregated sweep results are "
             f"missing: {path}"
         )
+
     with path.open("r", encoding="utf-8") as stream:
         records = json.load(stream)
+
     if not isinstance(records, list):
         raise TypeError(f"Expected a list of records in {path}.")
-    required = {"is_pareto_9d", *WEIGHT_NAMES, *OBJECTIVES}
+
+    required = {
+        "configuration_id",
+        *WEIGHT_NAMES,
+        *OBJECTIVES,
+    }
+
     for index, record in enumerate(records):
         missing = required.difference(record)
         if missing:
             raise KeyError(
                 f"Record {index} in {path} is missing: {sorted(missing)}"
             )
+
     return records
 
 
 # =============================================================================
 # Result aggregation
 # =============================================================================
-    
+
 def aggregate_configuration_records(
     run_records: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
+    """Average each metric across model seeds for every configuration."""
     grouped = {}
     for record in run_records:
         configuration_id = int(record["configuration_id"])
@@ -462,16 +482,20 @@ def aggregate_configuration_records(
 # Pareto analysis
 # =============================================================================
 
-def oriented_objective_matrix(
+def oriented_pair_matrix(
     records: Sequence[Mapping[str, object]],
+    *,
+    x_metric: str,
+    y_metric: str,
 ) -> np.ndarray:
-    """Return objectives in minimization form."""
+    """Return two objectives in minimization form."""
     return np.asarray(
         [
             [
-                float(record[metric_name])
-                * (-1.0 if higher_is_better else 1.0)
-                for metric_name, higher_is_better in OBJECTIVES.items()
+                float(record[x_metric])
+                * (-1.0 if OBJECTIVES[x_metric] else 1.0),
+                float(record[y_metric])
+                * (-1.0 if OBJECTIVES[y_metric] else 1.0),
             ]
             for record in records
         ],
@@ -517,525 +541,625 @@ def pareto_mask(
     return non_dominated
 
 
-# =============================================================================
-# Plot labeling utilities
-# =============================================================================
-
-def axis_label(metric_name: str) -> str:
-    labels = {
-        "observation_mse": "Observation reconstruction MSE",
-        "rollout_observation_mse_h5": "Observation rollout MSE (h=5)",
-        "rollout_latent_mse_h5": "Latent rollout MSE (h=5)",
-        "state_probe_r2": r"State probe $R^2$",
-        "state_cca_mean_correlation": r"State CCA mean $\rho$",
-        "state_linearity_gap": r"State linearity gap $\Delta_{\mathrm{lin}}$",
-        "neighborhood_trustworthiness": "Neighborhood trustworthiness",
-        "counterfactual_normalized_mse": "Counterfactual NMSE",
-        "conditional_nuisance_probe_accuracy": "Conditional nuisance accuracy",
-    }
-    return labels.get(metric_name, metric_name.replace("_", " "))
-
-
-def weight_label(weight_name: str) -> str:
-    abbreviations = {
-        "predictive": "pred",
-        "minimality": "min",
-        "temporal": "temp",
-        "observation": "obs",
-        "invariance": "inv",
-        "structural": "struct",
-    }
-    suffix = abbreviations.get(weight_name, weight_name)
-    return rf"$\lambda_{{\mathrm{{{suffix}}}}}$"
-
-
-# =============================================================================
-# Correlation analysis
-# =============================================================================
-
-def weight_metric_correlation_matrix(
-    records: Sequence[Mapping[str, object]],
-    *,
-    pareto_only: bool,
-) -> np.ndarray:
-    """Compute Spearman associations with all metrics oriented as better-up."""
-    selected = [
-        record for record in records
-        if not pareto_only or bool(record["is_pareto_9d"])
-    ]
-    if len(selected) < 3:
-        raise ValueError("At least three configurations are required.")
-    matrix = np.empty((len(WEIGHT_NAMES), len(OBJECTIVES)), dtype=float)
-    for wi, weight_name in enumerate(WEIGHT_NAMES):
-        weight_values = np.asarray(
-            [float(record[weight_name]) for record in selected], dtype=float
-        )
-        for mi, (metric_name, higher_is_better) in enumerate(OBJECTIVES.items()):
-            metric_values = np.asarray(
-                [float(record[metric_name]) for record in selected], dtype=float
-            )
-            if not higher_is_better:
-                metric_values = -metric_values
-            if (
-                np.allclose(weight_values, weight_values[0])
-                or np.allclose(metric_values, metric_values[0])
-            ):
-                correlation = float("nan")
-            else:
-                correlation = float(
-                    spearmanr(weight_values, metric_values).statistic
-                )
-            matrix[wi, mi] = correlation
-    return matrix
-
-
-# =============================================================================
-# Pareto projection plots
-# =============================================================================
-
-def plot_pareto_projection(
+def pairwise_pareto_mask(
     records: Sequence[Mapping[str, object]],
     *,
     x_metric: str,
     y_metric: str,
-    color_metric: str,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+) -> np.ndarray:
+    """Compute the Pareto mask for one pair of paper metrics."""
+    objectives = oriented_pair_matrix(
+        records,
+        x_metric=x_metric,
+        y_metric=y_metric,
+    )
+    return pareto_mask(
+        objectives,
+        absolute_tolerance=absolute_tolerance,
+        relative_tolerance=relative_tolerance,
+    )
+
+
+# =============================================================================
+# Pairwise Pareto plots
+# =============================================================================
+
+
+
+def representative_pareto_mask(
+    records: Sequence[Mapping[str, object]],
+    pareto: np.ndarray,
+    *,
+    x_metric: str,
+    y_metric: str,
+    minimum_distance: float,
+) -> np.ndarray:
+    """Select representative points from a 2-D Pareto front.
+
+    Distances are measured after min-max normalization of the two displayed
+    metrics. The first and last Pareto points are always retained. Intermediate
+    points are retained only when they are sufficiently far from the last
+    selected point. A non-positive threshold keeps every Pareto point.
+    """
+    pareto = np.asarray(pareto, dtype=bool)
+    representative = np.zeros_like(pareto)
+
+    indices = ordered_front_indices(
+        records,
+        pareto,
+        x_metric=x_metric,
+    )
+
+    if len(indices) == 0:
+        return representative
+
+    if minimum_distance <= 0.0 or len(indices) <= 2:
+        representative[indices] = True
+        return representative
+
+    x = np.asarray(
+        [float(records[index][x_metric]) for index in indices],
+        dtype=float,
+    )
+    y = np.asarray(
+        [float(records[index][y_metric]) for index in indices],
+        dtype=float,
+    )
+
+    def normalize(values: np.ndarray) -> np.ndarray:
+        span = float(np.max(values) - np.min(values))
+        if span <= 0.0:
+            return np.zeros_like(values)
+        return (values - np.min(values)) / span
+
+    points = np.column_stack([normalize(x), normalize(y)])
+
+    selected_positions = [0]
+    last_selected = 0
+
+    for position in range(1, len(indices) - 1):
+        distance = float(
+            np.linalg.norm(points[position] - points[last_selected])
+        )
+        if distance >= minimum_distance:
+            selected_positions.append(position)
+            last_selected = position
+
+    if selected_positions[-1] != len(indices) - 1:
+        selected_positions.append(len(indices) - 1)
+
+    representative[
+        indices[np.asarray(selected_positions, dtype=int)]
+    ] = True
+
+    return representative
+
+def build_global_pareto_labels(
+    records: Sequence[Mapping[str, object]],
+    *,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+    outlier_iqr_multiplier: float,
+    label_minimum_distance: float,
+) -> tuple[
+    dict[tuple[str, str], np.ndarray],
+    dict[tuple[str, str], np.ndarray],
+    dict[tuple[str, str], np.ndarray],
+    dict[int, str],
+]:
+    """Compute all pairwise fronts and assign stable global labels.
+
+    A configuration receives one label, such as P1, and keeps that label in
+    every figure in which it appears. Labels are assigned by increasing
+    configuration identifier over the union of all pairwise Pareto sets.
+    """
+    pair_masks = {}
+    pair_inlier_masks = {}
+    pair_representative_masks = {}
+    pareto_configuration_ids = set()
+
+    for x_metric, y_metric in OBJECTIVE_PAIRS:
+        x_values = np.asarray(
+            [float(record[x_metric]) for record in records],
+            dtype=float,
+        )
+        y_values = np.asarray(
+            [float(record[y_metric]) for record in records],
+            dtype=float,
+        )
+
+        inliers = pairwise_inlier_mask(
+            x_values,
+            y_values,
+            iqr_multiplier=outlier_iqr_multiplier,
+        )
+        pair_inlier_masks[(x_metric, y_metric)] = inliers
+
+        inlier_records = [
+            record
+            for record, keep in zip(records, inliers, strict=True)
+            if keep
+        ]
+
+        inlier_pareto = pairwise_pareto_mask(
+            inlier_records,
+            x_metric=x_metric,
+            y_metric=y_metric,
+            absolute_tolerance=absolute_tolerance,
+            relative_tolerance=relative_tolerance,
+        )
+
+        mask = np.zeros(len(records), dtype=bool)
+        mask[np.flatnonzero(inliers)] = inlier_pareto
+        pair_masks[(x_metric, y_metric)] = mask
+
+        representative = representative_pareto_mask(
+            records,
+            mask,
+            x_metric=x_metric,
+            y_metric=y_metric,
+            minimum_distance=label_minimum_distance,
+        )
+        pair_representative_masks[(x_metric, y_metric)] = representative
+
+        pareto_configuration_ids.update(
+            int(record["configuration_id"])
+            for record, is_representative in zip(
+                records,
+                representative,
+                strict=True,
+            )
+            if is_representative
+        )
+
+    labels = {
+        configuration_id: f"P{label_index}"
+        for label_index, configuration_id in enumerate(
+            sorted(pareto_configuration_ids),
+            start=1,
+        )
+    }
+
+    return pair_masks, pair_inlier_masks, pair_representative_masks, labels
+
+
+def global_pareto_configuration_records(
+    records: Sequence[Mapping[str, object]],
+    labels: Mapping[int, str],
+) -> list[dict[str, object]]:
+    """Return one table row per globally labeled Pareto configuration."""
+    rows = []
+
+    for record in records:
+        configuration_id = int(record["configuration_id"])
+        if configuration_id not in labels:
+            continue
+
+        rows.append(
+            {
+                "label": labels[configuration_id],
+                "configuration_id": configuration_id,
+                **{
+                    weight_name: float(record[weight_name])
+                    for weight_name in WEIGHT_NAMES
+                },
+                **{
+                    metric_name: float(record[metric_name])
+                    for metric_name in OBJECTIVES
+                },
+            }
+        )
+
+    rows.sort(
+        key=lambda row: int(str(row["label"])[1:])
+    )
+    return rows
+
+def ordered_front_indices(
+    records: Sequence[Mapping[str, object]],
+    pareto: np.ndarray,
+    *,
+    x_metric: str,
+) -> np.ndarray:
+    """Order Pareto points from best to worst along the oriented x objective."""
+    indices = np.flatnonzero(pareto)
+    oriented_x = np.asarray(
+        [
+            float(records[index][x_metric])
+            * (-1.0 if OBJECTIVES[x_metric] else 1.0)
+            for index in indices
+        ],
+        dtype=float,
+    )
+    return indices[np.argsort(oriented_x)]
+
+
+
+def pairwise_inlier_mask(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    *,
+    iqr_multiplier: float,
+) -> np.ndarray:
+    """Return configurations retained for one pairwise Pareto analysis.
+
+    Tukey fences are estimated independently on both metrics using all
+    configurations. Points outside either fence are excluded before the
+    Pareto set is computed. A negative multiplier disables filtering.
+    """
+    x_values = np.asarray(x_values, dtype=float)
+    y_values = np.asarray(y_values, dtype=float)
+
+    if x_values.shape != y_values.shape:
+        raise ValueError("x_values and y_values must have identical shapes.")
+
+    if iqr_multiplier < 0.0 or x_values.size < 4:
+        return np.ones(x_values.shape, dtype=bool)
+
+    keep = np.ones(x_values.shape, dtype=bool)
+
+    for values in (x_values, y_values):
+        q1, q3 = np.quantile(values, [0.25, 0.75])
+        iqr = q3 - q1
+
+        if not np.isfinite(iqr) or iqr <= 0.0:
+            continue
+
+        lower = q1 - iqr_multiplier * iqr
+        upper = q3 + iqr_multiplier * iqr
+        keep &= (values >= lower) & (values <= upper)
+
+    return keep
+
+
+def plot_pairwise_pareto(
+    records: Sequence[Mapping[str, object]],
+    *,
+    x_metric: str,
+    y_metric: str,
+    pareto: np.ndarray,
+    representative: np.ndarray,
+    inliers: np.ndarray,
+    labels: Mapping[int, str],
     output_path: Path,
-) -> Path:
+) -> tuple[Path, dict[str, object]]:
+    """Plot one 2-D Pareto front as a staircase."""
     x_values = np.asarray(
-        [float(record[x_metric]) for record in records]
+        [float(record[x_metric]) for record in records],
+        dtype=float,
     )
     y_values = np.asarray(
-        [float(record[y_metric]) for record in records]
+        [float(record[y_metric]) for record in records],
+        dtype=float,
     )
-    color_values = np.asarray(
-        [float(record[color_metric]) for record in records]
+
+    pareto = np.asarray(pareto, dtype=bool)
+    if pareto.shape != (len(records),):
+        raise ValueError(
+            "pareto mask must have shape "
+            f"({len(records)},), got {pareto.shape}."
+        )
+
+    front_indices = ordered_front_indices(
+        records,
+        pareto,
+        x_metric=x_metric,
     )
-    pareto = np.asarray(
-        [bool(record["is_pareto_9d"]) for record in records]
-    )
+
+    inliers = np.asarray(inliers, dtype=bool)
+    if inliers.shape != (len(records),):
+        raise ValueError(
+            "inlier mask must have shape "
+            f"({len(records)},), got {inliers.shape}."
+        )
+
+    dominated_inliers = inliers & (~pareto)
+    n_excluded_outliers = int(np.sum(~inliers))
 
     figure, axis = plt.subplots(figsize=(7.2, 5.6))
 
     axis.scatter(
-        x_values[~pareto],
-        y_values[~pareto],
+        x_values[dominated_inliers],
+        y_values[dominated_inliers],
         s=28,
-        alpha=0.18,
+        alpha=0.22,
         label="Dominated configurations",
+        zorder=1,
     )
 
-    scatter = axis.scatter(
+    axis.scatter(
         x_values[pareto],
         y_values[pareto],
-        c=color_values[pareto],
-        s=64,
-        alpha=0.88,
+        s=62,
+        alpha=0.9,
         edgecolors="black",
-        linewidths=0.5,
-        label="9-D Pareto set",
+        linewidths=0.55,
+        label="2-D Pareto front",
+        zorder=3,
     )
 
-    axis.set_xlabel(axis_label(x_metric))
-    axis.set_ylabel(axis_label(y_metric))
+    representative = np.asarray(representative, dtype=bool)
+    if representative.shape != (len(records),):
+        raise ValueError(
+            "representative mask must have shape "
+            f"({len(records)},), got {representative.shape}."
+        )
+
+    representative_indices = ordered_front_indices(
+        records,
+        representative,
+        x_metric=x_metric,
+    )
+
+    label_texts = []
+
+    for index in representative_indices:
+        configuration_id = int(records[index]["configuration_id"])
+        label_texts.append(
+            axis.text(
+                x_values[index],
+                y_values[index],
+                labels[configuration_id],
+                fontsize=8,
+                fontweight="bold",
+                ha="center",
+                va="center",
+                bbox={
+                    "boxstyle": "round,pad=0.15",
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.9,
+                },
+                zorder=4,
+            )
+        )
+
+    if label_texts:
+        adjust_text(
+            label_texts,
+            ax=axis,
+            x=x_values[representative_indices],
+            y=y_values[representative_indices],
+            only_move={
+                "text": "xy",
+                "static": "xy",
+                "explode": "xy",
+                "pull": "xy",
+            },
+            force_text=(0.5, 0.8),
+            force_static=(0.2, 0.2),
+            expand=(1.2, 1.3),
+            min_arrow_len=3,
+            arrowprops={
+                "arrowstyle": "-",
+                "color": "0.4",
+                "linewidth": 0.6,
+            },
+        )
+
+    if len(front_indices) >= 2:
+        axis.step(
+            x_values[front_indices],
+            y_values[front_indices],
+            where="post",
+            linewidth=1.6,
+            alpha=0.9,
+            zorder=2,
+        )
+
+    axis.set_xlabel(OBJECTIVE_LABELS[x_metric])
+    axis.set_ylabel(OBJECTIVE_LABELS[y_metric])
     axis.grid(alpha=0.22)
     axis.legend()
-
-    colorbar = figure.colorbar(scatter, ax=axis)
-    colorbar.set_label(axis_label(color_metric))
 
     figure.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, bbox_inches="tight")
     plt.close(figure)
 
-    return output_path
+    pareto_solutions = [
+        {
+            "label": labels[int(records[index]["configuration_id"])],
+            "configuration_id": int(records[index]["configuration_id"]),
+            x_metric: float(records[index][x_metric]),
+            y_metric: float(records[index][y_metric]),
+            **{
+                weight_name: float(records[index][weight_name])
+                for weight_name in WEIGHT_NAMES
+            },
+        }
+        for index in representative_indices
+    ]
+
+    summary = {
+        "x_metric": x_metric,
+        "y_metric": y_metric,
+        "n_configurations": len(records),
+        "n_pareto": int(np.sum(pareto)),
+        "n_labeled_pareto": int(np.sum(representative)),
+        "pareto_fraction": float(np.mean(pareto)),
+        "n_excluded_outliers": n_excluded_outliers,
+        "pareto_configuration_ids": [
+            solution["configuration_id"]
+            for solution in pareto_solutions
+        ],
+        "pareto_solutions": pareto_solutions,
+    }
+
+    return output_path, summary
 
 
-def plot_default_projections(
-    records: Sequence[Mapping[str, object]],
-    output_dir: Path,
-) -> list[Path]:
-    """Generate the default Pareto projection figures."""
-    paths = []
-
-    for index, (x_metric, y_metric, color_metric) in enumerate(
-        DEFAULT_PROJECTIONS,
-        start=1,
-    ):
-        path = output_dir / (
-            f"pareto_projection_{index:02d}_"
-            f"{x_metric}_vs_{y_metric}_"
-            f"color_{color_metric}.pdf"
-        )
-        paths.append(
-            plot_pareto_projection(
-                records,
-                x_metric=x_metric,
-                y_metric=y_metric,
-                color_metric=color_metric,
-                output_path=path,
-            )
-        )
-
-    return paths
-    
-
-# =============================================================================
-# Constraint–metric graph
-# =============================================================================
-
-def plot_constraint_metric_bipartite_graph(
+def plot_all_pairwise_pareto_fronts(
     records: Sequence[Mapping[str, object]],
     *,
-    output_path: Path,
-    pareto_only: bool = False,
-    minimum_absolute_correlation: float = 0.25,
-) -> Path:
-    """
-    Plot a bipartite graph linking constraint weights to representation
-    properties.
+    output_dir: Path,
+    pair_masks: Mapping[tuple[str, str], np.ndarray],
+    pair_inlier_masks: Mapping[tuple[str, str], np.ndarray],
+    pair_representative_masks: Mapping[tuple[str, str], np.ndarray],
+    labels: Mapping[int, str],
+) -> tuple[list[Path], list[dict[str, object]]]:
+    """Generate the four selected pairwise Pareto figures with shared P labels."""
+    paths = []
+    summaries = []
 
-    Edge width and opacity encode the absolute Spearman correlation.
-    Edge color encodes its sign:
-
-    - positive: increasing the weight is associated with better oriented
-      performance;
-    - negative: increasing the weight is associated with worse oriented
-      performance.
-
-    Parameters
-    ----------
-    records:
-        Aggregated sweep records containing the six weights, nine metrics,
-        and ``is_pareto_9d``.
-    output_path:
-        Destination PNG or PDF path.
-    pareto_only:
-        Restrict the analysis to Pareto-optimal configurations.
-    minimum_absolute_correlation:
-        Hide associations weaker than this threshold.
-    """
-    if not 0.0 <= minimum_absolute_correlation <= 1.0:
-        raise ValueError(
-            "minimum_absolute_correlation must lie in [0, 1]."
-        )
-
-    correlation_matrix = weight_metric_correlation_matrix(
-        records,
-        pareto_only=pareto_only,
-    )
-
-    weight_names = list(
-        WEIGHT_NAMES
-    )
-
-    metric_names = list(
-        OBJECTIVES
-    )
-
-    edges: list[
-        tuple[
-            int,
-            int,
-            float,
-        ]
-    ] = []
-
-    for weight_index in range(
-        correlation_matrix.shape[0]
+    for pair_index, (x_metric, y_metric) in enumerate(
+        OBJECTIVE_PAIRS,
+        start=1,
     ):
-        for metric_index in range(
-            correlation_matrix.shape[1]
-        ):
-            correlation = float(
-                correlation_matrix[
-                    weight_index,
-                    metric_index,
-                ]
-            )
-
-            if not np.isfinite(
-                correlation
-            ):
-                continue
-
-            if abs(
-                correlation
-            ) < minimum_absolute_correlation:
-                continue
-
-            edges.append(
-                (
-                    weight_index,
-                    metric_index,
-                    correlation,
-                )
-            )
-
-    if not edges:
-        raise ValueError(
-            "No association exceeds the requested correlation threshold."
+        filename = (
+            f"pareto_2d_{pair_index:02d}_"
+            f"{OBJECTIVE_SHORT_NAMES[x_metric]}_vs_"
+            f"{OBJECTIVE_SHORT_NAMES[y_metric]}.pdf"
         )
 
-    # Fixed bipartite geometry
-    metric_node_left_x = 0.8
-    weight_node_right_x = 0.1
-    edge_gap = 0.01
-
-    weight_y = np.linspace(
-        0.88,
-        0.12,
-        len(weight_names),
-    )
-
-    metric_y = np.linspace(
-        0.94,
-        0.06,
-        len(metric_names),
-    )
-
-    figure, axis = plt.subplots(
-        figsize=(
-            12.0,
-            8.5,
-        )
-    )
-
-    axis.set_xlim(
-        0.0,
-        1.0,
-    )
-    axis.set_ylim(
-        0.0,
-        1.0,
-    )
-    axis.axis(
-        "off"
-    )
-
-    axis.text(
-        weight_node_right_x + 0.006,
-        0.985,
-        "Constraint\nweights",
-        horizontalalignment="right",
-        verticalalignment="top",
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    axis.text(
-        metric_node_left_x - 0.006,
-        0.985,
-        "Representation properties",
-        horizontalalignment="left",
-        verticalalignment="top",
-        fontsize=13,
-        fontweight="bold",
-    )
-
-    # Nodes
-    for weight_index, weight_name in enumerate(
-        weight_names
-    ):
-        axis.text(
-            weight_node_right_x,
-            weight_y[
-                weight_index
-            ],
-            weight_label(
-                weight_name
-            ),
-            horizontalalignment="right",
-            verticalalignment="center",
-            fontsize=13,
-            bbox={
-                "boxstyle": "round,pad=0.42",
-                "facecolor": "white",
-                "edgecolor": "black",
-                "linewidth": 1.1,
-            },
-            zorder=4,
+        path, summary = plot_pairwise_pareto(
+            records,
+            x_metric=x_metric,
+            y_metric=y_metric,
+            pareto=pair_masks[(x_metric, y_metric)],
+            representative=pair_representative_masks[(x_metric, y_metric)],
+            inliers=pair_inlier_masks[(x_metric, y_metric)],
+            labels=labels,
+            output_path=output_dir / filename,
         )
 
-    for metric_index, metric_name in enumerate(metric_names):
-        axis.text(
-            metric_node_left_x,
-            metric_y[metric_index],
-            axis_label(metric_name),
-            horizontalalignment="left",
-            verticalalignment="center",
-            fontsize=11,
-            bbox={
-                "boxstyle": "round,pad=0.38",
-                "facecolor": "white",
-                "edgecolor": "black",
-                "linewidth": 1.0,
-            },
-            zorder=4,
-        )
+        paths.append(path)
+        summaries.append(summary)
 
-    normalization = Normalize(
-        vmin=-1.0,
-        vmax=1.0,
-    )
-
-    colormap = plt.get_cmap(
-        "RdYlGn"
-    )
-
-    # Draw weak edges first so that strong associations remain visible
-    for (
-        weight_index,
-        metric_index,
-        correlation,
-    ) in sorted(
-        edges,
-        key=lambda item: abs(
-            item[2]
-        ),
-    ):
-        absolute_correlation = abs(
-            correlation
-        )
-
-        linewidth = (
-            0.6
-            + 5.0
-            * absolute_correlation
-        )
-
-        alpha = (
-            0.12
-            + 0.78
-            * absolute_correlation
-        )
-
-        start = (
-            weight_node_right_x + edge_gap,
-            weight_y[weight_index],
-        )
-
-        end = (
-            metric_node_left_x - edge_gap,
-            metric_y[metric_index],
-        )
-
-        # Curvature reduces complete overlap between nearby edges
-        vertical_difference = (
-            metric_y[
-                metric_index
-            ]
-            - weight_y[
-                weight_index
-            ]
-        )
-
-        curvature = float(
-            np.clip(
-                0.08
-                * np.sign(
-                    vertical_difference
-                ),
-                -0.12,
-                0.12,
-            )
-        )
-
-        edge = FancyArrowPatch(
-            start,
-            end,
-            arrowstyle="-",
-            connectionstyle=(
-                f"arc3,rad={curvature}"
-            ),
-            linewidth=linewidth,
-            color=colormap(
-                normalization(
-                    correlation
-                )
-            ),
-            alpha=alpha,
-            zorder=1,
-        )
-
-        axis.add_patch(
-            edge
-        )
-
-    scalar_mappable = ScalarMappable(
-        norm=normalization,
-        cmap=colormap,
-    )
-
-    scalar_mappable.set_array(
-        []
-    )
-
-    colorbar = figure.colorbar(
-        scalar_mappable,
-        ax=axis,
-        fraction=0.025,
-        pad=0.05,
-    )
-
-    colorbar.set_label(
-        "Spearman correlation with oriented performance",
-        fontsize=12,
-    )
-
-    colorbar.ax.tick_params(
-        labelsize=11,
-    )
-
-    figure.tight_layout(
-        rect=(
-            0.0,
-            0.04,
-            1.0,
-            1.0,
-        )
-    )
-
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    figure.savefig(output_path, bbox_inches="tight")
-    plt.close(figure)
-
-    return output_path
+    return paths, summaries
 
 
 # =============================================================================
 # Figure orchestration
 # =============================================================================
-    
+
 def generate_analysis_figures(
     records: Sequence[Mapping[str, object]],
     *,
     output_dir: Path,
-) -> list[Path]:
-    """Generate all Pareto and weight-analysis figures from saved records."""
+    absolute_tolerance: float,
+    relative_tolerance: float,
+    outlier_iqr_multiplier: float,
+    label_minimum_distance: float,
+) -> tuple[
+    list[Path],
+    list[dict[str, object]],
+    dict[int, str],
+]:
+    """Generate the ten pairwise Pareto figures."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    paths = plot_default_projections(records, output_dir / "pareto_projections")
-    paths.append(
-        plot_constraint_metric_bipartite_graph(
-            records,
-            pareto_only=False,
-            minimum_absolute_correlation=0.25,
-            output_path=(output_dir / "constraint_metric_graph_all.pdf"),
-        )
+
+    (
+        pair_masks,
+        pair_inlier_masks,
+        pair_representative_masks,
+        labels,
+    ) = build_global_pareto_labels(
+        records,
+        absolute_tolerance=absolute_tolerance,
+        relative_tolerance=relative_tolerance,
+        outlier_iqr_multiplier=outlier_iqr_multiplier,
+        label_minimum_distance=label_minimum_distance,
     )
-    paths.append(
-        plot_constraint_metric_bipartite_graph(
-            records,
-            pareto_only=True,
-            minimum_absolute_correlation=0.25,
-            output_path=(output_dir / "constraint_metric_graph_pareto.pdf"),
-        )
+
+    paths, summaries = plot_all_pairwise_pareto_fronts(
+        records,
+        output_dir=output_dir,
+        pair_masks=pair_masks,
+        pair_inlier_masks=pair_inlier_masks,
+        pair_representative_masks=pair_representative_masks,
+        labels=labels,
     )
-    return paths
+
+    return paths, summaries, labels
+
+
+
+def save_global_pareto_configurations(
+    records: Sequence[Mapping[str, object]],
+    labels: Mapping[int, str],
+    *,
+    output_dir: Path,
+) -> None:
+    """Save the global P-label-to-configuration correspondence."""
+    rows = global_pareto_configuration_records(records, labels)
+
+    save_records(
+        rows,
+        json_path=output_dir / "pareto_configurations.json",
+        csv_path=output_dir / "pareto_configurations.csv",
+    )
+
+def save_pareto_summaries(
+    summaries: Sequence[Mapping[str, object]],
+    *,
+    output_dir: Path,
+) -> None:
+    """Save pairwise Pareto counts and ordered configuration identifiers."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_dir / "pareto_2d_summary.json"
+    with json_path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            list(summaries),
+            stream,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+
+    csv_records = [
+        {
+            **{
+                key: value
+                for key, value in summary.items()
+                if key != "pareto_configuration_ids"
+            },
+            "pareto_configuration_ids": ",".join(
+                str(configuration_id)
+                for configuration_id in summary["pareto_configuration_ids"]
+            ),
+        }
+        for summary in summaries
+    ]
+
+    save_records(
+        csv_records,
+        json_path=output_dir / "pareto_2d_summary_flat.json",
+        csv_path=output_dir / "pareto_2d_summary.csv",
+    )
+
+
+def print_pareto_solutions(
+    summaries: Sequence[Mapping[str, object]],
+) -> None:
+    """Print all pairwise Pareto solutions and their six weights."""
+    for summary in summaries:
+        print()
+        print(
+            f"{summary['x_metric']} vs {summary['y_metric']} "
+            f"({summary['n_pareto']} Pareto solutions; "
+            f"{summary['n_labeled_pareto']} labeled representatives; "
+            f"{summary['n_excluded_outliers']} outliers excluded before analysis)"
+        )
+        print("-" * 96)
+
+        for solution in summary["pareto_solutions"]:
+            weights = ", ".join(
+                f"{name}={float(solution[name]):.4g}"
+                for name in WEIGHT_NAMES
+            )
+            print(
+                f"{solution['label']} | "
+                f"config {int(solution['configuration_id']):04d} | "
+                f"{summary['x_metric']}="
+                f"{float(solution[summary['x_metric']]):.6g} | "
+                f"{summary['y_metric']}="
+                f"{float(solution[summary['y_metric']]):.6g} | "
+                f"{weights}"
+            )
 
 
 # =============================================================================
@@ -1045,8 +1169,8 @@ def generate_analysis_figures(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a six-weight CLSM sweep, evaluate nine objectives, "
-            "and compute the discrete nine-dimensional Pareto set."
+            "Run a six-weight CLSM sweep, evaluate five metrics, "
+            "and compute the four selected pairwise 2-D Pareto fronts."
         )
     )
 
@@ -1103,22 +1227,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
     )
+    parser.add_argument(
+        "--plot-outlier-iqr-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Exclude configurations outside Tukey fences on either axis before "
+            "computing each 2-D Pareto front. Use a negative value to disable "
+            "filtering."
+        ),
+    )
+    parser.add_argument(
+        "--pareto-label-minimum-distance",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum Euclidean distance between labeled Pareto solutions "
+            "after min-max normalization of the displayed metrics. The full "
+            "front remains plotted; only representative solutions are named. "
+            "Use 0 to label every Pareto solution."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--analyze-only",
         action="store_true",
         help=(
             "Skip training and evaluation, reload existing per-run evaluation "
-            "files, and rebuild the aggregate Pareto analysis."
+            "files, and rebuild the aggregate analysis."
         ),
     )
     parser.add_argument(
         "--figures-only",
         action="store_true",
         help=(
-            "Generate all figures directly from the existing "
-            "sweep_configuration_results.json file, without training, "
-            "evaluation, aggregation, or Pareto recomputation."
+            "Generate the ten pairwise Pareto figures directly from the "
+            "existing sweep_configuration_results.json file."
         ),
     )
 
@@ -1144,29 +1288,44 @@ def main() -> None:
         parser.error("--model-seeds must be unique.")
     if 5 not in args.rollout_horizons:
         parser.error(
-            "The nine-objective analysis requires rollout horizon 5."
+            "The five-metric analysis requires rollout horizon 5."
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.figures_only:
         records = load_configuration_results(args.output_dir)
-        figure_paths = generate_analysis_figures(
+        figure_paths, summaries, labels = generate_analysis_figures(
             records,
             output_dir=args.output_dir / "figures",
+            absolute_tolerance=args.pareto_absolute_tolerance,
+            relative_tolerance=args.pareto_relative_tolerance,
+            outlier_iqr_multiplier=args.plot_outlier_iqr_multiplier,
+            label_minimum_distance=args.pareto_label_minimum_distance,
         )
+        save_pareto_summaries(
+            summaries,
+            output_dir=args.output_dir,
+        )
+        save_global_pareto_configurations(
+            records,
+            labels,
+            output_dir=args.output_dir,
+        )
+        print_pareto_solutions(summaries)
+
         print()
         print_separator()
         print("FIGURE GENERATION COMPLETED")
         print(f"Configurations : {len(records)}")
-        print(
-            "Pareto points  : "
-            f"{sum(bool(record['is_pareto_9d']) for record in records)}"
-        )
+        print(f"Pareto fronts  : {len(summaries)}")
+        for summary in summaries:
+            print(
+                f"  {summary['x_metric']} vs {summary['y_metric']}: "
+                f"{summary['n_pareto']}/{summary['n_configurations']} "
+                f"({summary['pareto_fraction']:.3f})"
+            )
         print(f"Figures dir    : {args.output_dir / 'figures'}")
-        print("Figures:")
-        for path in figure_paths:
-            print(f"  {path}")
         print_separator()
         return
 
@@ -1282,27 +1441,9 @@ def main() -> None:
         )
 
     aggregated_records = aggregate_configuration_records(run_records)
-    objective_matrix = oriented_objective_matrix(aggregated_records)
-    mask = pareto_mask(
-        objective_matrix,
-        absolute_tolerance=args.pareto_absolute_tolerance,
-        relative_tolerance=args.pareto_relative_tolerance,
-    )
-
-    annotated_records = [
-        {
-            **record,
-            "is_pareto_9d": bool(is_pareto),
-        }
-        for record, is_pareto in zip(
-            aggregated_records,
-            mask,
-            strict=True,
-        )
-    ]
 
     save_records(
-        annotated_records,
+        aggregated_records,
         json_path=(
             args.output_dir
             / "sweep_configuration_results.json"
@@ -1313,36 +1454,41 @@ def main() -> None:
         ),
     )
 
-    pareto_records = [
-        record
-        for record in annotated_records
-        if record["is_pareto_9d"]
-    ]
-
-    save_records(
-        pareto_records,
-        json_path=args.output_dir / "pareto_9d.json",
-        csv_path=args.output_dir / "pareto_9d.csv",
-    )
-
-    projection_paths = generate_analysis_figures(
-        annotated_records,
+    figure_paths, summaries, labels = generate_analysis_figures(
+        aggregated_records,
         output_dir=args.output_dir / "figures",
+        absolute_tolerance=args.pareto_absolute_tolerance,
+        relative_tolerance=args.pareto_relative_tolerance,
+        outlier_iqr_multiplier=args.plot_outlier_iqr_multiplier,
+        label_minimum_distance=args.pareto_label_minimum_distance,
     )
+
+    save_pareto_summaries(
+        summaries,
+        output_dir=args.output_dir,
+    )
+    save_global_pareto_configurations(
+        aggregated_records,
+        labels,
+        output_dir=args.output_dir,
+    )
+    print_pareto_solutions(summaries)
 
     print()
     print_separator()
     print("SWEEP COMPLETED")
     print(f"Configurations : {len(aggregated_records)}")
     print(f"Model runs     : {len(run_records)}")
-    print(f"Pareto points  : {len(pareto_records)}")
-    print(
-        "Pareto fraction: "
-        f"{len(pareto_records) / max(len(aggregated_records), 1):.3f}"
-    )
+    print(f"Pareto fronts  : {len(summaries)}")
+    for summary in summaries:
+        print(
+            f"  {summary['x_metric']} vs {summary['y_metric']}: "
+            f"{summary['n_pareto']}/{summary['n_configurations']} "
+            f"({summary['pareto_fraction']:.3f})"
+        )
     print(f"Analysis dir   : {args.output_dir}")
     print("Figures:")
-    for path in projection_paths:
+    for path in figure_paths:
         print(f"  {path}")
     print_separator()
 
