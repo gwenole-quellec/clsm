@@ -192,6 +192,7 @@ The experiments reported in the accompanying paper were performed with:
 | scikit-learn | 1.9.0 |
 | pandas | 3.0.3 |
 | Matplotlib | 3.11.0 |
+| adjustText | 1.4.0 |
 | tqdm | 4.68.4 |
 
 ## Current limitations and future work
