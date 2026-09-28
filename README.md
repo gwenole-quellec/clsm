@@ -139,9 +139,8 @@ selected pairwise Pareto fronts from five representation-level metrics.
 - [`clsm/`](clsm/) — generic CLSM framework
 - [`toy/`](toy/) — synthetic environment and training entry point
 - [`scripts/`](scripts/) — training, evaluation, sweep, and visualization pipelines
-- [`overview/`](overview/) — conceptual overview
 - [`model_cards/`](model_cards/) — CLSM descriptions of representative methods
-- [`docs/`](docs/) — implementation and reproducibility documentation
+- [`implementation/`](implementation/) — implementation and reproducibility documentation
 
 ---
 
