@@ -57,218 +57,108 @@
         "minimality": 0,
         "temporal": 0.5,
         "observation": 0.5,
-        "invariance": 1,
-        "structural": 0
-      }
-    },
-    "P3": {
-      "weights": {
-        "predictive": 1,
-        "minimality": 0,
-        "temporal": 0.5,
-        "observation": 0.5,
-        "invariance": 3,
+        "invariance": 0.3,
         "structural": 0
       }
     },
     "P5": {
       "weights": {
-        "predictive": 0.0610141,
-        "minimality": 5.37711e-05,
-        "temporal": 0.855688,
+        "predictive": 0.061014146092951804,
+        "minimality": 0.000053771116679615836,
+        "temporal": 0.8556880270448219,
         "observation": 0,
-        "invariance": 0.0225154,
-        "structural": 0.0111922
-      }
-    },
-    "P6": {
-      "weights": {
-        "predictive": 1.75951,
-        "minimality": 1.1914e-05,
-        "temporal": 0.0386258,
-        "observation": 1.96025,
-        "invariance": 0.0153563,
-        "structural": 0.0040043
+        "invariance": 0.01,
+        "structural": 0.011192191152638902
       }
     },
     "P7": {
       "weights": {
-        "predictive": 0.98852,
+        "predictive": 0.3137558816446292,
         "minimality": 0,
-        "temporal": 1.81894,
-        "observation": 0.260345,
-        "invariance": 0.154989,
-        "structural": 0.0431969
+        "temporal": 1.4456819664381515,
+        "observation": 0.005839066174297178,
+        "invariance": 0.02950724859028504,
+        "structural": 0.015410603709052796
       }
     },
-    "P9": {
+    "P12": {
       "weights": {
-        "predictive": 0.01,
-        "minimality": 5.37711e-05,
-        "temporal": 0.855688,
+        "predictive": 0.02468859449534781,
+        "minimality": 0.00003621916125901684,
+        "temporal": 0.3498338971086348,
         "observation": 0,
-        "invariance": 0.0225154,
-        "structural": 0.0111922
-      }
-    },
-    "P10": {
-      "weights": {
-        "predictive": 0.0610141,
-        "minimality": 5.37711e-05,
-        "temporal": 0.855688,
-        "observation": 0,
-        "invariance": 0.01,
-        "structural": 0.0111922
-      }
-    },
-    "P11": {
-      "weights": {
-        "predictive": 2.04763,
-        "minimality": 0.00271661,
-        "temporal": 0.587543,
-        "observation": 0.243102,
-        "invariance": 0,
-        "structural": 0.0151772
-      }
-    },
-    "P14": {
-      "weights": {
-        "predictive": 0.906149,
-        "minimality": 0,
-        "temporal": 0.067924,
-        "observation": 0.80046,
-        "invariance": 0.0253298,
-        "structural": 0.00220911
-      }
-    },
-    "P16": {
-      "weights": {
-        "predictive": 2.32997,
-        "minimality": 7.31709e-05,
-        "temporal": 0.378469,
-        "observation": 0.350122,
-        "invariance": 0.616405,
-        "structural": 0.00645561
+        "invariance": 0.03308004891078969,
+        "structural": 0.007168406184322079
       }
     },
     "P17": {
       "weights": {
-        "predictive": 0.251819,
-        "minimality": 6.29707e-05,
-        "temporal": 0.770617,
-        "observation": 1.64847,
-        "invariance": 0.110971,
-        "structural": 0.00362863
+        "predictive": 0.07466087448015632,
+        "minimality": 0.0000763797928998481,
+        "temporal": 0.9270301116557655,
+        "observation": 2.1149377970566516,
+        "invariance": 0.06773999208637656,
+        "structural": 0.007235234453861638
       }
     },
-    "P21": {
+    "P18": {
       "weights": {
-        "predictive": 0.581786,
+        "predictive": 0.5817858323219943,
         "minimality": 0,
-        "temporal": 0.613007,
+        "temporal": 0.613006690255604,
         "observation": 0,
-        "invariance": 0.0116556,
-        "structural": 0.0159355
+        "invariance": 0.01165558020958119,
+        "structural": 0.015935491900565594
       }
     },
     "P22": {
       "weights": {
-        "predictive": 1.89537,
-        "minimality": 2.85405e-05,
-        "temporal": 0.0473974,
-        "observation": 0.938959,
-        "invariance": 0.0180449,
-        "structural": 0.00258384
+        "predictive": 1.497497270385803,
+        "minimality": 0.00001903755264532593,
+        "temporal": 0.015560298897339803,
+        "observation": 1.310057146879601,
+        "invariance": 0.025316939549268495,
+        "structural": 0
       }
     },
-    "P25": {
+    "P26": {
       "weights": {
-        "predictive": 1.3516,
-        "minimality": 1.23798e-05,
-        "temporal": 1.28856,
-        "observation": 0.103595,
-        "invariance": 0.13612,
-        "structural": 0.0160481
+        "predictive": 2.8486107158899774,
+        "minimality": 0.0005862168918127479,
+        "temporal": 1.6038169336129262,
+        "observation": 0.19209071937908304,
+        "invariance": 0,
+        "structural": 0.055445885647748105
       }
     },
     "P27": {
       "weights": {
-        "predictive": 0.0791077,
-        "minimality": 1.52581e-05,
-        "temporal": 0.271206,
-        "observation": 0.0310098,
-        "invariance": 0.0648903,
-        "structural": 0.00791854
-      }
-    },
-    "P28": {
-      "weights": {
-        "predictive": 0.25082,
-        "minimality": 0,
-        "temporal": 0.427036,
-        "observation": 0.00940311,
-        "invariance": 0.0118897,
-        "structural": 0.0062191
+        "predictive": 0.07910772754681619,
+        "minimality": 0.000015258067453993295,
+        "temporal": 0.2712058222314604,
+        "observation": 0.031009798410818322,
+        "invariance": 0.06489027146015026,
+        "structural": 0.007918541929125585
       }
     },
     "P29": {
       "weights": {
-        "predictive": 0.018154,
-        "minimality": 4.62351e-05,
-        "temporal": 0.351976,
+        "predictive": 0.018153969424802748,
+        "minimality": 0.00004623507771160371,
+        "temporal": 0.35197606953593685,
         "observation": 0,
-        "invariance": 0.0108563,
-        "structural": 0.00517994
+        "invariance": 0.010856343274015181,
+        "structural": 0.005179941307949824
       }
     },
-    "P35": {
+    "P34": {
       "weights": {
         "predictive": 0,
-        "minimality": 3.72553e-05,
-        "temporal": 1.28965,
+        "minimality": 0.0000372553370962998,
+        "temporal": 1.289653341913852,
         "observation": 0,
-        "invariance": 0.0270095,
-        "structural": 0.0130458
-      }
-    },
-    "P36": {
-      "weights": {
-        "predictive": 0.112162,
-        "minimality": 0,
-        "temporal": 1.21701,
-        "observation": 0.0187602,
-        "invariance": 0.0260177,
-        "structural": 0.0228753
-      }
-    },
-    "P39": {
-      "weights": {
-        "predictive": 0.299505,
-        "minimality": 2.30466e-05,
-        "temporal": 0.942879,
-        "observation": 0.0841877,
-        "invariance": 0.221415,
-        "structural": 0.0114669
-      }
-    },
-    "P42": {
-      "weights": {
-        "predictive": 1.16036,
-        "minimality": 0,
-        "temporal": 0.423681,
-        "observation": 0.0395255,
-        "invariance": 0.960285,
-        "structural": 0.0333754
-      }
-    },
-    "P49": {
-      "weights": {
-        "predictive": 1.07863,
-        "minimality": 3.19169e-05,
-        "temporal": 0.951802,
-        "observation": 0.0496034,
-        "invariance": 0.218244,
-        "structural": 0.00773274
+        "invariance": 0.027009454421203706,
+        "structural": 0.013045810050011819
       }
     }
   }

@@ -463,8 +463,12 @@ The retained panels compare:
 
 1. prediction vs counterfactual consistency;
 2. prediction vs nuisance suppression;
-3. neighborhood preservation vs nuisance suppression;
+3. state accessibility vs counterfactual consistency;
 4. state accessibility vs neighborhood preservation.
+
+Together, these panels contrast predictive performance with two complementary
+notions of invariance, and examine how physical-state accessibility relates to
+both invariance and local geometric preservation.
 
 Pareto fronts are always computed from all configurations.
 

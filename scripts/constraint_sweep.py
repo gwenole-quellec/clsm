@@ -180,8 +180,8 @@ OBJECTIVE_PAIRS = (
         "nuisance_latent_strong_class_balanced_accuracy",
     ),
     (
-        "neighborhood_trustworthiness",
-        "nuisance_latent_strong_class_balanced_accuracy",
+        "state_probe_r2",
+        "counterfactual_relative_energy",
     ),
     (
         "state_probe_r2",
@@ -1410,7 +1410,7 @@ def print_representative_pareto_solutions(
             )
 
 
-def save_table4(
+def save_pareto_table(
     rows: Sequence[Mapping[str, object]],
     output_dir: Path,
 ) -> None:
@@ -1510,9 +1510,9 @@ def save_table4(
         ]
     )
 
-    markdown_path = output_dir / "table4.md"
+    markdown_path = output_dir / "pareto_table.md"
 
-    latex_path = output_dir / "table4.tex"
+    latex_path = output_dir / "pareto_table.tex"
 
     markdown_path.write_text(
         "\n".join(
@@ -1545,7 +1545,7 @@ def save_global_pareto_configurations(
             f"({chr(97 + index)})" for index, summary in enumerate(summaries)
             if row["configuration_id"] in summary["representative_pareto_configuration_ids"]
         )
-    save_table4(rows, output_dir)
+    save_pareto_table(rows, output_dir)
 
     save_records(
         rows,
