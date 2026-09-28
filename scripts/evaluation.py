@@ -11,13 +11,13 @@ Evaluation families
 -------------------
 1. observation compatibility;
 2. latent dynamics and multi-step prediction;
-3. state accessibility through linear, nonlinear, and temporal probes;
+3. state accessibility through linear probes, with optional nonlinear and
+   temporal probes in the full evaluation profile;
 4. canonical correlation between latent and physical state spaces;
 5. local and global neighborhood preservation;
 6. latent compactness and effective dimensionality;
 7. counterfactual consistency;
-8. nuisance accessibility and nuisance-subspace removal;
-9. optional metrics from the adversarial nuisance head.
+8. nuisance accessibility through independent post-hoc probes.
 
 Design principles
 -----------------
@@ -33,27 +33,27 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
+import platform
+import uuid
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import torch
 from numpy.typing import NDArray
 from scipy.stats import spearmanr
 from sklearn.cross_decomposition import CCA
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.linear_model import LinearRegression
 from sklearn.manifold import trustworthiness
-from sklearn.metrics import (
-    accuracy_score,
-    mean_squared_error,
-    pairwise_distances,
-    r2_score,
-)
+from sklearn.metrics import mean_squared_error, pairwise_distances, r2_score
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -62,8 +62,48 @@ from tqdm.auto import tqdm
 
 from clsm.datasets import CLSMDataset, DatasetSplits
 from clsm.models import CLSMModel, CLSMModelConfig
+from clsm.nuisance_probes import NuisanceAudit, PhysicalAudit
 from clsm.training import make_loader, move_batch_to_device, resolve_device
 from clsm.utils import print_separator
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_NUM_WORKERS = 0
+DEFAULT_PIN_MEMORY = True
+DEFAULT_DEVICE = "auto"
+
+DEFAULT_ROLLOUT_HORIZONS = (
+    1,
+    5,
+    10,
+)
+
+DEFAULT_PROBE_MAX_SAMPLES = 100_000
+DEFAULT_NONLINEAR_PROBE_MAX_SAMPLES = 25_000
+DEFAULT_TEMPORAL_PROBE_MAX_SAMPLES = 100_000
+
+DEFAULT_CCA_MAX_SAMPLES = 50_000
+DEFAULT_CCA_MAX_ITERATIONS = 2_000
+DEFAULT_CCA_TOLERANCE = 1e-6
+
+DEFAULT_NEIGHBORHOOD_MAX_SAMPLES = 5_000
+DEFAULT_NEIGHBORHOOD_NEIGHBORS = 15
+
+DEFAULT_PROBE_SEED = 42
+DEFAULT_NUISANCE_PROBE_EPOCHS = 500
+DEFAULT_PROBE_WORKERS = 1
+
+PROBE_PROFILES = (
+    "full",
+    "pareto",
+)
+DEFAULT_PROBE_PROFILE = "full"
+
+DEFAULT_PROBE_CACHE_DIR = ".probe-cache"
 
 
 # =============================================================================
@@ -81,31 +121,22 @@ MetricDict = dict[str, MetricValue]
 # =============================================================================
 
 @dataclass(frozen=True)
-class EvaluationConfig:
-    """Configuration for deterministic post-hoc evaluation."""
+class CCAAnalysis:
+    """Complete CCA artifacts fitted on train and evaluated on one split."""
 
-    batch_size: int = 256
-    num_workers: int = 0
-    pin_memory: bool = True
-    device: str = "auto"
+    canonical_correlations: FloatArray
+    state_loadings: FloatArray
+    latent_loadings: FloatArray
 
-    rollout_horizons: tuple[int, ...] = (1, 5, 10)
+    state_weights: FloatArray
+    latent_weights: FloatArray
+    state_rotations: FloatArray
+    latent_rotations: FloatArray
 
-    probe_max_samples: int = 100_000
-    nonlinear_probe_max_samples: int = 25_000
-    temporal_probe_max_samples: int = 100_000
-
-    cca_max_samples: int = 50_000
-    cca_max_iter: int = 2_000
-    cca_tolerance: float = 1e-6
-
-    neighborhood_max_samples: int = 5_000
-    neighborhood_neighbors: int = 15
-
-    probe_seed: int = 42
-
-    save_latents: bool = False
-    output_dir: str | None = None
+    state_scaler_mean: FloatArray
+    state_scaler_scale: FloatArray
+    latent_scaler_mean: FloatArray
+    latent_scaler_scale: FloatArray
 
 
 @dataclass(frozen=True)
@@ -126,7 +157,6 @@ class EncodedDataset:
     counterfactual_observation: FloatArray | None = None
     counterfactual_latent: FloatArray | None = None
     predicted_next_latent: FloatArray | None = None
-    nuisance_logits: FloatArray | None = None
 
     @property
     def n_episodes(self) -> int:
@@ -153,22 +183,37 @@ class EncodedDataset:
 
 
 @dataclass(frozen=True)
-class CCAAnalysis:
-    """Complete CCA artifacts fitted on train and evaluated on one split."""
+class EvaluationConfig:
+    """Configuration for deterministic post-hoc evaluation."""
 
-    canonical_correlations: FloatArray
-    state_loadings: FloatArray
-    latent_loadings: FloatArray
+    batch_size: int = DEFAULT_BATCH_SIZE
+    num_workers: int = DEFAULT_NUM_WORKERS
+    pin_memory: bool = DEFAULT_PIN_MEMORY
+    device: str = DEFAULT_DEVICE
 
-    state_weights: FloatArray
-    latent_weights: FloatArray
-    state_rotations: FloatArray
-    latent_rotations: FloatArray
+    rollout_horizons: tuple[int, ...] = DEFAULT_ROLLOUT_HORIZONS
 
-    state_scaler_mean: FloatArray
-    state_scaler_scale: FloatArray
-    latent_scaler_mean: FloatArray
-    latent_scaler_scale: FloatArray
+    probe_max_samples: int = DEFAULT_PROBE_MAX_SAMPLES
+    nonlinear_probe_max_samples: int = DEFAULT_NONLINEAR_PROBE_MAX_SAMPLES
+    temporal_probe_max_samples: int = DEFAULT_TEMPORAL_PROBE_MAX_SAMPLES
+
+    cca_max_samples: int = DEFAULT_CCA_MAX_SAMPLES
+    cca_max_iter: int = DEFAULT_CCA_MAX_ITERATIONS
+    cca_tolerance: float = DEFAULT_CCA_TOLERANCE
+
+    neighborhood_max_samples: int = DEFAULT_NEIGHBORHOOD_MAX_SAMPLES
+    neighborhood_neighbors: int = DEFAULT_NEIGHBORHOOD_NEIGHBORS
+
+    probe_seed: int = DEFAULT_PROBE_SEED
+    nuisance_probe_epochs: int = DEFAULT_NUISANCE_PROBE_EPOCHS
+    strong_probe_epochs: int | None = None
+    physical_probe_epochs: int | None = None
+    probe_workers: int = DEFAULT_PROBE_WORKERS
+    probe_profile: str = DEFAULT_PROBE_PROFILE
+    probe_cache_dir: str | None = DEFAULT_PROBE_CACHE_DIR
+
+    save_latents: bool = False
+    output_dir: str | None = None
 
 
 # =============================================================================
@@ -209,6 +254,10 @@ def load_checkpoint_model(
         checkpoint["model_state_dict"]
     )
     model.eval()
+
+    model._checkpoint_digest = hashlib.sha256(
+        checkpoint_path.read_bytes()
+    ).hexdigest()
 
     return model, checkpoint
 
@@ -262,7 +311,7 @@ def load_splits(
 # =============================================================================
 
 @torch.no_grad()
-def encode_dataset(
+def _encode_dataset_uncached(
     model: CLSMModel,
     dataset: CLSMDataset,
     *,
@@ -293,7 +342,6 @@ def encode_dataset(
     counterfactual_observation_batches: list[Tensor] = []
     counterfactual_latent_batches: list[Tensor] = []
     predicted_next_batches: list[Tensor] = []
-    nuisance_logit_batches: list[Tensor] = []
 
     model.eval()
 
@@ -309,10 +357,16 @@ def encode_dataset(
 
         output = model(
             batch["observation"],
-            counterfactual_observation=counterfactual_observation,
             sample=False,
-            adversarial_coefficient=0.0,
         )
+
+        counterfactual_latent = None
+
+        if counterfactual_observation is not None:
+            counterfactual_latent = model.encode(
+                counterfactual_observation,
+                sample=False,
+            )["latent"]
 
         latent_batches.append(
             output["latent"].cpu()
@@ -340,19 +394,14 @@ def encode_dataset(
                 counterfactual_observation.cpu()
             )
 
-        if "counterfactual_latent" in output:
+        if counterfactual_latent is not None:
             counterfactual_latent_batches.append(
-                output["counterfactual_latent"].cpu()
+                counterfactual_latent.cpu()
             )
 
         if "predicted_next_latent" in output:
             predicted_next_batches.append(
                 output["predicted_next_latent"].cpu()
-            )
-
-        if "nuisance_logits" in output:
-            nuisance_logit_batches.append(
-                output["nuisance_logits"].cpu()
             )
 
     latent = torch.cat(
@@ -434,20 +483,116 @@ def encode_dataset(
             if predicted_next_batches
             else None
         ),
-        nuisance_logits=(
-            torch.cat(
-                nuisance_logit_batches,
-                dim=0,
-            ).numpy()
-            if nuisance_logit_batches
-            else None
-        ),
     )
 
 
 # =============================================================================
 # Array utilities
 # =============================================================================
+
+def encode_dataset(
+    model: CLSMModel,
+    dataset: CLSMDataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    device: torch.device,
+) -> EncodedDataset:
+    """
+    Encode a dataset deterministically, using the persistent cache when enabled.
+
+    The cache key includes the checkpoint, complete dataset content, relevant
+    runtime information, and source hashes for the evaluation and model code.
+    """
+    cache_dir = getattr(
+        model,
+        "_encoding_cache_dir",
+        None,
+    )
+
+    checkpoint_digest = getattr(
+        model,
+        "_checkpoint_digest",
+        None,
+    )
+
+    if cache_dir is None or checkpoint_digest is None:
+        return _encode_dataset_uncached(
+            model,
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            device=device,
+        )
+
+    from clsm import models
+
+    key = joblib.hash(
+        (
+            checkpoint_digest,
+            dataset,
+            batch_size,
+            str(device),
+            str(torch.__version__),
+            np.__version__,
+            platform.python_version(),
+            hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            hashlib.sha256(
+                Path(models.__file__).read_bytes()
+            ).hexdigest(),
+        )
+    )
+
+    directory = (
+        Path(cache_dir)
+        / "encodings"
+    )
+
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path = (
+        directory
+        / f"{key}.joblib"
+    )
+
+    if path.exists():
+        return EncodedDataset(
+            **joblib.load(path)
+        )
+
+    encoded = _encode_dataset_uncached(
+        model,
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        device=device,
+    )
+
+    temporary = (
+        directory
+        / f"{key}.{uuid.uuid4().hex}.tmp"
+    )
+
+    joblib.dump(
+        vars(encoded),
+        temporary,
+    )
+
+    os.replace(
+        temporary,
+        path,
+    )
+
+    return encoded
+
 
 def _flatten_time(
     values: NDArray,
@@ -456,38 +601,6 @@ def _flatten_time(
     return values.reshape(
         -1,
         values.shape[-1],
-    )
-
-
-def _subsample_rows(
-    features: FloatArray,
-    targets: NDArray,
-    *,
-    max_samples: int,
-    seed: int,
-) -> tuple[FloatArray, NDArray]:
-    """Deterministically subsample paired rows."""
-    if features.shape[0] != targets.shape[0]:
-        raise ValueError(
-            "features and targets must have the same number of rows."
-        )
-
-    if features.shape[0] <= max_samples:
-        return features, targets
-
-    generator = np.random.default_rng(
-        seed
-    )
-
-    indices = generator.choice(
-        features.shape[0],
-        size=max_samples,
-        replace=False,
-    )
-
-    return (
-        features[indices],
-        targets[indices],
     )
 
 
@@ -547,27 +660,390 @@ def _safe_pearson(
     )
 
 
-def _flatten_latent_and_nuisance(
-    encoded: EncodedDataset,
-) -> tuple[FloatArray, IntArray]:
-    latent = _flatten_time(
-        encoded.latent
+def _subsample_rows(
+    features: FloatArray,
+    targets: NDArray,
+    *,
+    max_samples: int,
+    seed: int,
+) -> tuple[FloatArray, NDArray]:
+    """Deterministically subsample paired rows."""
+    if features.shape[0] != targets.shape[0]:
+        raise ValueError(
+            "features and targets must have the same number of rows."
+        )
+
+    if features.shape[0] <= max_samples:
+        return features, targets
+
+    generator = np.random.default_rng(
+        seed
     )
 
-    nuisance = np.repeat(
-        encoded.nuisance_id,
-        encoded.episode_length,
+    indices = generator.choice(
+        features.shape[0],
+        size=max_samples,
+        replace=False,
     )
 
     return (
-        latent,
-        nuisance,
+        features[indices],
+        targets[indices],
     )
 
 
 # =============================================================================
 # Direct representation metrics
 # =============================================================================
+
+def invariance_metrics(
+    encoded: EncodedDataset,
+) -> dict[str, float]:
+    """Evaluate consistency across counterfactual nuisance interventions."""
+    if encoded.counterfactual_latent is None:
+        return {}
+
+    latent_a = encoded.latent
+    latent_b = encoded.counterfactual_latent
+
+    difference = (
+        latent_a
+        - latent_b
+    )
+
+    flat_a = _flatten_time(
+        latent_a
+    )
+    flat_b = _flatten_time(
+        latent_b
+    )
+
+    norm_a = np.linalg.norm(
+        flat_a,
+        axis=1,
+    )
+
+    norm_b = np.linalg.norm(
+        flat_b,
+        axis=1,
+    )
+
+    denominator = np.maximum(
+        norm_a * norm_b,
+        1e-12,
+    )
+
+    cosine = (
+        np.sum(
+            flat_a * flat_b,
+            axis=1,
+        )
+        / denominator
+    )
+
+    latent_scale = np.mean(
+        np.sum(
+            (
+                flat_a
+                - flat_a.mean(
+                    axis=0,
+                    keepdims=True,
+                )
+            ) ** 2,
+            axis=1,
+        )
+    )
+
+    normalized_mse = (
+        np.mean(
+            difference**2
+        )
+        / max(
+            latent_scale,
+            1e-12,
+        )
+    )
+
+    return {
+        "counterfactual_relative_energy": float(normalized_mse * encoded.latent_dim),
+        "counterfactual_latent_mse": float(
+            np.mean(
+                difference**2
+            )
+        ),
+        "counterfactual_latent_mae": float(
+            np.mean(
+                np.abs(difference)
+            )
+        ),
+        "counterfactual_cosine_similarity": float(
+            np.mean(cosine)
+        ),
+        "counterfactual_normalized_mse": float(
+            normalized_mse
+        ),
+    }
+
+
+def minimality_metrics(
+    encoded: EncodedDataset,
+) -> dict[str, float]:
+    """Characterize compactness, covariance, and effective dimensionality."""
+    flat = _flatten_time(
+        encoded.latent
+    )
+
+    centered = (
+        flat
+        - flat.mean(
+            axis=0,
+            keepdims=True,
+        )
+    )
+
+    variance = np.var(
+        flat,
+        axis=0,
+    )
+
+    total_variance = float(
+        np.sum(
+            variance
+        )
+    )
+
+    participation_ratio = (
+        0.0
+        if total_variance <= 1e-12
+        else (
+            total_variance**2
+            / max(
+                float(
+                    np.sum(
+                        variance**2
+                    )
+                ),
+                1e-12,
+            )
+        )
+    )
+
+    covariance = np.cov(
+        centered,
+        rowvar=False,
+    )
+
+    covariance = np.atleast_2d(
+        covariance
+    )
+
+    eigenvalues = np.linalg.eigvalsh(
+        covariance
+    )
+
+    eigenvalues = np.maximum(
+        eigenvalues,
+        0.0,
+    )
+
+    positive = eigenvalues[
+        eigenvalues > 1e-12
+    ]
+
+    covariance_condition = (
+        float(
+            positive.max()
+            / positive.min()
+        )
+        if positive.size >= 2
+        else float("inf")
+    )
+
+    off_diagonal = (
+        covariance
+        - np.diag(
+            np.diag(covariance)
+        )
+    )
+
+    singular_values = np.linalg.svd(
+        centered,
+        full_matrices=False,
+        compute_uv=False,
+    )
+
+    squared = singular_values**2
+
+    explained = (
+        squared
+        / max(
+            float(
+                np.sum(squared)
+            ),
+            1e-12,
+        )
+    )
+
+    cumulative = np.cumsum(
+        explained
+    )
+
+    dimensions_95 = int(
+        np.searchsorted(
+            cumulative,
+            0.95,
+        )
+        + 1
+    )
+
+    metrics = {
+        "latent_mean_abs": float(
+            np.mean(
+                np.abs(flat)
+            )
+        ),
+        "latent_mean_squared": float(
+            np.mean(
+                flat**2
+            )
+        ),
+        "latent_norm_mean": float(
+            np.mean(
+                np.linalg.norm(
+                    flat,
+                    axis=1,
+                )
+            )
+        ),
+        "latent_std_global": float(
+            np.std(flat)
+        ),
+        "latent_total_variance": total_variance,
+        "latent_active_dimensions": float(
+            np.sum(
+                variance > 1e-4
+            )
+        ),
+        "latent_participation_ratio": float(
+            participation_ratio
+        ),
+        "latent_dimensions_95pct": float(
+            dimensions_95
+        ),
+        "latent_covariance_rank": float(
+            np.linalg.matrix_rank(
+                covariance,
+                tol=1e-10,
+            )
+        ),
+        "latent_covariance_condition_number": covariance_condition,
+        "latent_covariance_offdiag_mean_abs": float(
+            np.mean(
+                np.abs(
+                    off_diagonal
+                )
+            )
+        ),
+    }
+
+    for dimension_index, value in enumerate(
+        variance
+    ):
+        metrics[
+            f"latent_variance_dim_{dimension_index}"
+        ] = float(value)
+
+    return metrics
+
+
+def neighborhood_preservation_metrics(
+    encoded: EncodedDataset,
+    *,
+    max_samples: int,
+    n_neighbors: int,
+    seed: int,
+) -> dict[str, float]:
+    """Measure local and global geometry preservation."""
+    latent = _flatten_time(
+        encoded.latent
+    )
+    state = _flatten_time(
+        encoded.true_state
+    )
+
+    n_samples = latent.shape[0]
+
+    if n_samples < 3:
+        return {}
+
+    sample_size = min(
+        max_samples,
+        n_samples,
+    )
+
+    generator = np.random.default_rng(
+        seed
+    )
+
+    if sample_size < n_samples:
+        indices = generator.choice(
+            n_samples,
+            size=sample_size,
+            replace=False,
+        )
+
+        latent = latent[indices]
+        state = state[indices]
+
+    effective_neighbors = min(
+        max(
+            1,
+            n_neighbors,
+        ),
+        max(
+            1,
+            (sample_size - 1) // 2,
+        ),
+    )
+
+    state_distances = pairwise_distances(
+        state
+    )
+
+    latent_distances = pairwise_distances(
+        latent
+    )
+
+    upper = np.triu_indices(
+        sample_size,
+        k=1,
+    )
+
+    correlation = spearmanr(
+        state_distances[upper],
+        latent_distances[upper],
+    ).statistic
+
+    return {
+        "neighborhood_state_distance_spearman": float(
+            correlation
+        ),
+        "neighborhood_trustworthiness": float(
+            trustworthiness(
+                state,
+                latent,
+                n_neighbors=effective_neighbors,
+            )
+        ),
+        "neighborhood_continuity": float(
+            trustworthiness(
+                latent,
+                state,
+                n_neighbors=effective_neighbors,
+            )
+        ),
+    }
+
     
 def observation_compatibility_metrics(
     encoded: EncodedDataset,
@@ -625,57 +1101,6 @@ def observation_compatibility_metrics(
                         valid_features
                     )
                 ]
-            )
-        )
-
-    return metrics
-
-
-def temporal_coherence_metrics(
-    encoded: EncodedDataset,
-) -> dict[str, float]:
-    """Evaluate local latent smoothness and one-step transition quality."""
-    latent = encoded.latent
-
-    first_difference = (
-        latent[:, 1:, :]
-        - latent[:, :-1, :]
-    )
-
-    second_difference = (
-        latent[:, 2:, :]
-        - 2.0 * latent[:, 1:-1, :]
-        + latent[:, :-2, :]
-    )
-
-    metrics = {
-        "latent_step_mse": float(
-            np.mean(
-                first_difference**2
-            )
-        ),
-        "latent_acceleration_mse": float(
-            np.mean(
-                second_difference**2
-            )
-        ),
-    }
-
-    if encoded.predicted_next_latent is not None:
-        target_next = latent[:, 1:, :]
-        error = (
-            encoded.predicted_next_latent
-            - target_next
-        )
-
-        metrics["latent_transition_mse"] = float(
-            np.mean(
-                error**2
-            )
-        )
-        metrics["latent_transition_mae"] = float(
-            np.mean(
-                np.abs(error)
             )
         )
 
@@ -865,417 +1290,55 @@ def rollout_metrics(
     return metrics
 
 
-def neighborhood_preservation_metrics(
-    encoded: EncodedDataset,
-    *,
-    max_samples: int,
-    n_neighbors: int,
-    seed: int,
-) -> dict[str, float]:
-    """Measure local and global geometry preservation."""
-    latent = _flatten_time(
-        encoded.latent
-    )
-    state = _flatten_time(
-        encoded.true_state
-    )
-
-    n_samples = latent.shape[0]
-
-    if n_samples < 3:
-        return {}
-
-    sample_size = min(
-        max_samples,
-        n_samples,
-    )
-
-    generator = np.random.default_rng(
-        seed
-    )
-
-    if sample_size < n_samples:
-        indices = generator.choice(
-            n_samples,
-            size=sample_size,
-            replace=False,
-        )
-
-        latent = latent[indices]
-        state = state[indices]
-
-    effective_neighbors = min(
-        max(
-            1,
-            n_neighbors,
-        ),
-        max(
-            1,
-            (sample_size - 1) // 2,
-        ),
-    )
-
-    state_distances = pairwise_distances(
-        state
-    )
-
-    latent_distances = pairwise_distances(
-        latent
-    )
-
-    upper = np.triu_indices(
-        sample_size,
-        k=1,
-    )
-
-    correlation = spearmanr(
-        state_distances[upper],
-        latent_distances[upper],
-    ).statistic
-
-    return {
-        "neighborhood_state_distance_spearman": float(
-            correlation
-        ),
-        "neighborhood_trustworthiness": float(
-            trustworthiness(
-                state,
-                latent,
-                n_neighbors=effective_neighbors,
-            )
-        ),
-        "neighborhood_continuity": float(
-            trustworthiness(
-                latent,
-                state,
-                n_neighbors=effective_neighbors,
-            )
-        ),
-    }
-
-
-def minimality_metrics(
+def temporal_coherence_metrics(
     encoded: EncodedDataset,
 ) -> dict[str, float]:
-    """Characterize compactness, covariance, and effective dimensionality."""
-    flat = _flatten_time(
-        encoded.latent
+    """Evaluate local latent smoothness and one-step transition quality."""
+    latent = encoded.latent
+
+    first_difference = (
+        latent[:, 1:, :]
+        - latent[:, :-1, :]
     )
 
-    centered = (
-        flat
-        - flat.mean(
-            axis=0,
-            keepdims=True,
-        )
-    )
-
-    variance = np.var(
-        flat,
-        axis=0,
-    )
-
-    total_variance = float(
-        np.sum(
-            variance
-        )
-    )
-
-    participation_ratio = (
-        0.0
-        if total_variance <= 1e-12
-        else (
-            total_variance**2
-            / max(
-                float(
-                    np.sum(
-                        variance**2
-                    )
-                ),
-                1e-12,
-            )
-        )
-    )
-
-    covariance = np.cov(
-        centered,
-        rowvar=False,
-    )
-
-    covariance = np.atleast_2d(
-        covariance
-    )
-
-    eigenvalues = np.linalg.eigvalsh(
-        covariance
-    )
-
-    eigenvalues = np.maximum(
-        eigenvalues,
-        0.0,
-    )
-
-    positive = eigenvalues[
-        eigenvalues > 1e-12
-    ]
-
-    covariance_condition = (
-        float(
-            positive.max()
-            / positive.min()
-        )
-        if positive.size >= 2
-        else float("inf")
-    )
-
-    off_diagonal = (
-        covariance
-        - np.diag(
-            np.diag(covariance)
-        )
-    )
-
-    singular_values = np.linalg.svd(
-        centered,
-        full_matrices=False,
-        compute_uv=False,
-    )
-
-    squared = singular_values**2
-
-    explained = (
-        squared
-        / max(
-            float(
-                np.sum(squared)
-            ),
-            1e-12,
-        )
-    )
-
-    cumulative = np.cumsum(
-        explained
-    )
-
-    dimensions_95 = int(
-        np.searchsorted(
-            cumulative,
-            0.95,
-        )
-        + 1
+    second_difference = (
+        latent[:, 2:, :]
+        - 2.0 * latent[:, 1:-1, :]
+        + latent[:, :-2, :]
     )
 
     metrics = {
-        "latent_mean_abs": float(
+        "latent_step_mse": float(
             np.mean(
-                np.abs(flat)
+                first_difference**2
             )
         ),
-        "latent_mean_squared": float(
+        "latent_acceleration_mse": float(
             np.mean(
-                flat**2
-            )
-        ),
-        "latent_norm_mean": float(
-            np.mean(
-                np.linalg.norm(
-                    flat,
-                    axis=1,
-                )
-            )
-        ),
-        "latent_std_global": float(
-            np.std(flat)
-        ),
-        "latent_total_variance": total_variance,
-        "latent_active_dimensions": float(
-            np.sum(
-                variance > 1e-4
-            )
-        ),
-        "latent_participation_ratio": float(
-            participation_ratio
-        ),
-        "latent_dimensions_95pct": float(
-            dimensions_95
-        ),
-        "latent_covariance_rank": float(
-            np.linalg.matrix_rank(
-                covariance,
-                tol=1e-10,
-            )
-        ),
-        "latent_covariance_condition_number": covariance_condition,
-        "latent_covariance_offdiag_mean_abs": float(
-            np.mean(
-                np.abs(
-                    off_diagonal
-                )
+                second_difference**2
             )
         ),
     }
 
-    for dimension_index, value in enumerate(
-        variance
-    ):
-        metrics[
-            f"latent_variance_dim_{dimension_index}"
-        ] = float(value)
+    if encoded.predicted_next_latent is not None:
+        target_next = latent[:, 1:, :]
+        error = (
+            encoded.predicted_next_latent
+            - target_next
+        )
+
+        metrics["latent_transition_mse"] = float(
+            np.mean(
+                error**2
+            )
+        )
+        metrics["latent_transition_mae"] = float(
+            np.mean(
+                np.abs(error)
+            )
+        )
 
     return metrics
-
-
-def invariance_metrics(
-    encoded: EncodedDataset,
-) -> dict[str, float]:
-    """Evaluate consistency across counterfactual nuisance interventions."""
-    if encoded.counterfactual_latent is None:
-        return {}
-
-    latent_a = encoded.latent
-    latent_b = encoded.counterfactual_latent
-
-    difference = (
-        latent_a
-        - latent_b
-    )
-
-    flat_a = _flatten_time(
-        latent_a
-    )
-    flat_b = _flatten_time(
-        latent_b
-    )
-
-    norm_a = np.linalg.norm(
-        flat_a,
-        axis=1,
-    )
-
-    norm_b = np.linalg.norm(
-        flat_b,
-        axis=1,
-    )
-
-    denominator = np.maximum(
-        norm_a * norm_b,
-        1e-12,
-    )
-
-    cosine = (
-        np.sum(
-            flat_a * flat_b,
-            axis=1,
-        )
-        / denominator
-    )
-
-    latent_scale = np.mean(
-        np.sum(
-            (
-                flat_a
-                - flat_a.mean(
-                    axis=0,
-                    keepdims=True,
-                )
-            ) ** 2,
-            axis=1,
-        )
-    )
-
-    normalized_mse = (
-        np.mean(
-            difference**2
-        )
-        / max(
-            latent_scale,
-            1e-12,
-        )
-    )
-
-    return {
-        "counterfactual_latent_mse": float(
-            np.mean(
-                difference**2
-            )
-        ),
-        "counterfactual_latent_mae": float(
-            np.mean(
-                np.abs(difference)
-            )
-        ),
-        "counterfactual_cosine_similarity": float(
-            np.mean(cosine)
-        ),
-        "counterfactual_normalized_mse": float(
-            normalized_mse
-        ),
-    }
-
-
-def adversarial_head_metrics(
-    encoded: EncodedDataset,
-) -> MetricDict:
-    """Evaluate the nuisance adversary on known nuisance classes."""
-    if encoded.nuisance_logits is None:
-        return {}
-
-    logits = encoded.nuisance_logits
-
-    if logits.ndim == 3:
-        labels = np.repeat(
-            encoded.nuisance_id,
-            logits.shape[1],
-        )
-        flat_logits = logits.reshape(
-            -1,
-            logits.shape[-1],
-        )
-    elif logits.ndim == 2:
-        labels = encoded.nuisance_id
-        flat_logits = logits
-    else:
-        return {}
-
-    if (
-        labels.size != flat_logits.shape[0]
-    ):
-        return {}
-
-    valid = (
-        labels >= 0
-    ) & (
-        labels < flat_logits.shape[-1]
-    )
-
-    if not np.all(valid):
-        return {
-            "adversarial_head_accuracy": None,
-            "adversarial_head_unseen_classes": float(
-                np.unique(
-                    labels[~valid]
-                ).size
-            ),
-        }
-
-    prediction = np.argmax(
-        flat_logits,
-        axis=-1,
-    )
-
-    return {
-        "adversarial_head_accuracy": float(
-            accuracy_score(
-                labels,
-                prediction,
-            )
-        ),
-        "adversarial_head_chance": float(
-            1.0
-            / flat_logits.shape[-1]
-        ),
-        "adversarial_head_unseen_classes": 0.0,
-    }
 
 
 # =============================================================================
@@ -1347,38 +1410,6 @@ def _fit_and_evaluate_state_probe(
     return metrics
 
 
-def fit_state_probe(
-    train_encoded: EncodedDataset,
-    evaluation_encoded: EncodedDataset,
-    *,
-    max_samples: int,
-    seed: int,
-) -> dict[str, float]:
-    """Fit a linear probe from latent representations to the true state."""
-    return _fit_and_evaluate_state_probe(
-        make_pipeline(
-            StandardScaler(),
-            LinearRegression(),
-        ),
-        _flatten_time(
-            train_encoded.latent
-        ),
-        _flatten_time(
-            train_encoded.true_state
-        ),
-        _flatten_time(
-            evaluation_encoded.latent
-        ),
-        _flatten_time(
-            evaluation_encoded.true_state
-        ),
-        evaluation_encoded.state_names,
-        metric_prefix="state_probe",
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-
 def fit_nonlinear_state_probe(
     train_encoded: EncodedDataset,
     evaluation_encoded: EncodedDataset,
@@ -1418,6 +1449,38 @@ def fit_nonlinear_state_probe(
         ),
         evaluation_encoded.state_names,
         metric_prefix="state_nonlinear_probe",
+        max_samples=max_samples,
+        seed=seed,
+    )
+
+
+def fit_state_probe(
+    train_encoded: EncodedDataset,
+    evaluation_encoded: EncodedDataset,
+    *,
+    max_samples: int,
+    seed: int,
+) -> dict[str, float]:
+    """Fit a linear probe from latent representations to the true state."""
+    return _fit_and_evaluate_state_probe(
+        make_pipeline(
+            StandardScaler(),
+            LinearRegression(),
+        ),
+        _flatten_time(
+            train_encoded.latent
+        ),
+        _flatten_time(
+            train_encoded.true_state
+        ),
+        _flatten_time(
+            evaluation_encoded.latent
+        ),
+        _flatten_time(
+            evaluation_encoded.true_state
+        ),
+        evaluation_encoded.state_names,
+        metric_prefix="state_probe",
         max_samples=max_samples,
         seed=seed,
     )
@@ -1768,438 +1831,6 @@ def canonical_state_analysis(
 
 
 # =============================================================================
-# Nuisance analysis
-# =============================================================================
-
-def fit_nuisance_probe(
-    train_encoded: EncodedDataset,
-    evaluation_encoded: EncodedDataset,
-    *,
-    max_samples: int,
-    seed: int,
-) -> MetricDict:
-    """Fit a post-hoc linear nuisance classifier on individual latent states."""
-    x_train, y_train = _flatten_latent_and_nuisance(
-        train_encoded
-    )
-
-    x_eval, y_eval = _flatten_latent_and_nuisance(
-        evaluation_encoded
-    )
-
-    x_train, y_train = _subsample_rows(
-        x_train,
-        y_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    x_eval, y_eval = _subsample_rows(
-        x_eval,
-        y_eval,
-        max_samples=max_samples,
-        seed=seed + 1,
-    )
-
-    train_classes = np.unique(
-        y_train
-    )
-
-    evaluation_classes = np.unique(
-        y_eval
-    )
-
-    if train_classes.size < 2:
-        return {
-            "nuisance_timepoint_probe_accuracy": None,
-            "nuisance_timepoint_probe_chance": None,
-            "nuisance_timepoint_probe_unseen_classes": 0.0,
-        }
-
-    unseen = np.setdiff1d(
-        evaluation_classes,
-        train_classes,
-    )
-
-    if unseen.size > 0:
-        return {
-            "nuisance_timepoint_probe_accuracy": None,
-            "nuisance_timepoint_probe_chance": None,
-            "nuisance_timepoint_probe_unseen_classes": float(
-                unseen.size
-            ),
-        }
-
-    probe = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(
-            max_iter=2_000,
-            random_state=seed,
-        ),
-    )
-
-    probe.fit(
-        x_train,
-        y_train,
-    )
-
-    prediction = probe.predict(
-        x_eval
-    )
-
-    return {
-        "nuisance_timepoint_probe_accuracy": float(
-            accuracy_score(
-                y_eval,
-                prediction,
-            )
-        ),
-        "nuisance_timepoint_probe_chance": float(
-            1.0
-            / train_classes.size
-        ),
-        "nuisance_timepoint_probe_unseen_classes": 0.0,
-    }
-
-
-def fit_conditional_nuisance_probe(
-    train_encoded: EncodedDataset,
-    evaluation_encoded: EncodedDataset,
-    *,
-    max_samples: int,
-    seed: int,
-) -> MetricDict:
-    """Probe nuisance accessibility after linearly controlling for state."""
-    x_train, y_train = _flatten_latent_and_nuisance(
-        train_encoded
-    )
-
-    x_eval, y_eval = _flatten_latent_and_nuisance(
-        evaluation_encoded
-    )
-
-    state_train = _flatten_time(
-        train_encoded.true_state
-    )
-
-    state_eval = _flatten_time(
-        evaluation_encoded.true_state
-    )
-
-    train_classes = np.unique(
-        y_train
-    )
-
-    evaluation_classes = np.unique(
-        y_eval
-    )
-
-    if train_classes.size < 2:
-        return {
-            "conditional_nuisance_probe_accuracy": None,
-            "conditional_nuisance_probe_chance": None,
-            "conditional_nuisance_probe_unseen_classes": 0.0,
-        }
-
-    unseen = np.setdiff1d(
-        evaluation_classes,
-        train_classes,
-    )
-
-    if unseen.size > 0:
-        return {
-            "conditional_nuisance_probe_accuracy": None,
-            "conditional_nuisance_probe_chance": None,
-            "conditional_nuisance_probe_unseen_classes": float(
-                unseen.size
-            ),
-        }
-
-    residualizer = make_pipeline(
-        StandardScaler(),
-        LinearRegression(),
-    )
-
-    residualizer.fit(
-        state_train,
-        x_train,
-    )
-
-    residual_train = (
-        x_train
-        - residualizer.predict(
-            state_train
-        )
-    )
-
-    residual_eval = (
-        x_eval
-        - residualizer.predict(
-            state_eval
-        )
-    )
-
-    residual_train, y_train = _subsample_rows(
-        residual_train,
-        y_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    residual_eval, y_eval = _subsample_rows(
-        residual_eval,
-        y_eval,
-        max_samples=max_samples,
-        seed=seed + 1,
-    )
-
-    probe = make_pipeline(
-        StandardScaler(),
-        LogisticRegression(
-            max_iter=2_000,
-            random_state=seed,
-        ),
-    )
-
-    probe.fit(
-        residual_train,
-        y_train,
-    )
-
-    prediction = probe.predict(
-        residual_eval
-    )
-
-    return {
-        "conditional_nuisance_probe_accuracy": float(
-            accuracy_score(
-                y_eval,
-                prediction,
-            )
-        ),
-        "conditional_nuisance_probe_chance": float(
-            1.0
-            / train_classes.size
-        ),
-        "conditional_nuisance_probe_unseen_classes": 0.0,
-    }
-
-
-def nuisance_subspace_removal_metrics(
-    train_encoded: EncodedDataset,
-    evaluation_encoded: EncodedDataset,
-    *,
-    max_samples: int,
-    seed: int,
-) -> MetricDict:
-    """Remove a linear nuisance subspace and re-evaluate state accessibility."""
-    x_train, nuisance_train = _flatten_latent_and_nuisance(
-        train_encoded
-    )
-
-    x_eval, nuisance_eval = _flatten_latent_and_nuisance(
-        evaluation_encoded
-    )
-
-    state_train = _flatten_time(
-        train_encoded.true_state
-    )
-
-    state_eval = _flatten_time(
-        evaluation_encoded.true_state
-    )
-
-    train_classes = np.unique(
-        nuisance_train
-    )
-
-    evaluation_classes = np.unique(
-        nuisance_eval
-    )
-
-    if train_classes.size < 2:
-        return {}
-
-    if np.setdiff1d(
-        evaluation_classes,
-        train_classes,
-    ).size > 0:
-        return {
-            "nuisance_removed_probe_accuracy": None,
-            "nuisance_removed_state_probe_r2": None,
-            "nuisance_removal_state_r2_delta": None,
-            "nuisance_subspace_rank": None,
-        }
-
-    scaler = StandardScaler()
-
-    standardized_train = scaler.fit_transform(
-        x_train
-    )
-
-    standardized_eval = scaler.transform(
-        x_eval
-    )
-
-    probe_train, nuisance_probe_train = _subsample_rows(
-        standardized_train,
-        nuisance_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    nuisance_probe = LogisticRegression(
-        max_iter=2_000,
-        random_state=seed,
-    )
-
-    nuisance_probe.fit(
-        probe_train,
-        nuisance_probe_train,
-    )
-
-    coefficients = np.asarray(
-        nuisance_probe.coef_,
-        dtype=float,
-    )
-
-    _, singular_values, right_vectors = np.linalg.svd(
-        coefficients,
-        full_matrices=False,
-    )
-
-    rank = int(
-        np.sum(
-            singular_values > 1e-10
-        )
-    )
-
-    if rank == 0:
-        cleaned_train = standardized_train
-        cleaned_eval = standardized_eval
-    else:
-        basis = right_vectors[
-            :rank
-        ].T
-
-        cleaned_train = (
-            standardized_train
-            - (
-                standardized_train
-                @ basis
-            )
-            @ basis.T
-        )
-
-        cleaned_eval = (
-            standardized_eval
-            - (
-                standardized_eval
-                @ basis
-            )
-            @ basis.T
-        )
-
-    cleaned_probe_train, cleaned_nuisance_train = _subsample_rows(
-        cleaned_train,
-        nuisance_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    cleaned_probe_eval, cleaned_nuisance_eval = _subsample_rows(
-        cleaned_eval,
-        nuisance_eval,
-        max_samples=max_samples,
-        seed=seed + 1,
-    )
-
-    residual_nuisance_probe = LogisticRegression(
-        max_iter=2_000,
-        random_state=seed,
-    )
-
-    residual_nuisance_probe.fit(
-        cleaned_probe_train,
-        cleaned_nuisance_train,
-    )
-
-    nuisance_prediction = residual_nuisance_probe.predict(
-        cleaned_probe_eval
-    )
-
-    state_train_features, state_train_targets = _subsample_rows(
-        cleaned_train,
-        state_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    state_probe = LinearRegression()
-
-    state_probe.fit(
-        state_train_features,
-        state_train_targets,
-    )
-
-    cleaned_state_prediction = state_probe.predict(
-        cleaned_eval
-    )
-
-    cleaned_state_r2 = float(
-        r2_score(
-            state_eval,
-            cleaned_state_prediction,
-            multioutput="variance_weighted",
-        )
-    )
-
-    original_state_probe = make_pipeline(
-        StandardScaler(),
-        LinearRegression(),
-    )
-
-    original_train_features, original_train_targets = _subsample_rows(
-        x_train,
-        state_train,
-        max_samples=max_samples,
-        seed=seed,
-    )
-
-    original_state_probe.fit(
-        original_train_features,
-        original_train_targets,
-    )
-
-    original_state_r2 = float(
-        r2_score(
-            state_eval,
-            original_state_probe.predict(
-                x_eval
-            ),
-            multioutput="variance_weighted",
-        )
-    )
-
-    return {
-        "nuisance_removed_probe_accuracy": float(
-            accuracy_score(
-                cleaned_nuisance_eval,
-                nuisance_prediction,
-            )
-        ),
-        "nuisance_removed_state_probe_r2": cleaned_state_r2,
-        "nuisance_removal_state_r2_delta": float(
-            cleaned_state_r2
-            - original_state_r2
-        ),
-        "nuisance_subspace_rank": float(
-            rank
-        ),
-    }
-
-
-# =============================================================================
 # Dataset evaluation orchestration
 # =============================================================================
 
@@ -2210,6 +1841,7 @@ def evaluate_dataset(
     train_encoded: EncodedDataset | None,
     config: EvaluationConfig,
     device: torch.device,
+    pre_encoded: EncodedDataset | None = None,
 ) -> tuple[
     MetricDict,
     EncodedDataset,
@@ -2218,11 +1850,12 @@ def evaluate_dataset(
     """
     Evaluate one dataset split.
 
-    Training-dependent probes (state probes, CCA, nuisance analyses) are
-    always fitted on `train_encoded` and evaluated on the current split,
-    ensuring strict separation between fitting and evaluation.
+    Training-dependent state probes and CCA mappings are fitted on
+    ``train_encoded`` and evaluated on the current split. Independent
+    nuisance and physical audits are applied separately by
+    ``evaluate_splits``.
     """
-    encoded = encode_dataset(
+    encoded = pre_encoded if pre_encoded is not None else encode_dataset(
         model,
         dataset,
         batch_size=config.batch_size,
@@ -2279,11 +1912,18 @@ def evaluate_dataset(
         )
     )
 
-    metrics.update(
-        adversarial_head_metrics(
-            encoded
-        )
-    )
+    if config.probe_profile == "pareto":
+        if train_encoded is not None:
+            metrics.update(
+                fit_state_probe(
+                    train_encoded,
+                    encoded,
+                    max_samples=config.probe_max_samples,
+                    seed=config.probe_seed,
+                )
+            )
+
+        return metrics, encoded, None
 
     if train_encoded is not None:
         linear_metrics = fit_state_probe(
@@ -2345,33 +1985,6 @@ def evaluate_dataset(
                 ]
             )
 
-        metrics.update(
-            fit_nuisance_probe(
-                train_encoded,
-                encoded,
-                max_samples=config.probe_max_samples,
-                seed=config.probe_seed,
-            )
-        )
-
-        metrics.update(
-            fit_conditional_nuisance_probe(
-                train_encoded,
-                encoded,
-                max_samples=config.probe_max_samples,
-                seed=config.probe_seed,
-            )
-        )
-
-        metrics.update(
-            nuisance_subspace_removal_metrics(
-                train_encoded,
-                encoded,
-                max_samples=config.probe_max_samples,
-                seed=config.probe_seed,
-            )
-        )
-
     return (
         metrics,
         encoded,
@@ -2394,8 +2007,34 @@ def evaluate_splits(
     Evaluate selected splits using probes fitted on the training split.
 
     The training split is encoded once and reused for all downstream
-    probe fitting.
+    probe fitting. Nuisance and physical audits are fitted using the
+    training and validation encodings, then applied independently to
+    each requested split.
     """
+
+    probe_budgets = (
+        config.strong_probe_epochs,
+        config.physical_probe_epochs,
+    )
+
+    if (
+        config.probe_workers < 1
+        or any(
+            budget is not None and budget < 1
+            for budget in probe_budgets
+        )
+    ):
+        raise ValueError(
+            "Probe workers and budgets must be positive."
+        )
+
+    if config.probe_profile not in PROBE_PROFILES:
+        raise ValueError(
+            f"Unknown probe profile: {config.probe_profile!r}."
+        )
+
+    model._encoding_cache_dir = config.probe_cache_dir
+
     device = next(
         model.parameters()
     ).device
@@ -2407,6 +2046,27 @@ def evaluate_splits(
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
         device=device,
+    )
+
+    validation_encoded = encode_dataset(
+        model,
+        splits.validation,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        device=device,
+    )
+
+    audit = NuisanceAudit(
+        train_encoded,
+        validation_encoded,
+        config,
+    )
+
+    physical_audit = PhysicalAudit(
+        train_encoded,
+        validation_encoded,
+        config,
     )
 
     split_map: dict[
@@ -2441,43 +2101,38 @@ def evaluate_splits(
                 f"Unknown split: {split_name}"
             )
 
-        dataset = split_map[
-            split_name
-        ]
+        dataset = split_map[split_name]
 
         if dataset is None:
             continue
 
         if split_name == "train":
-            encoded = train_encoded
+            pre_encoded = train_encoded
 
-            (
-                metrics,
-                _,
-                cca_analysis,
-            ) = evaluate_dataset(
-                model,
-                dataset,
-                train_encoded=train_encoded,
-                config=config,
-                device=device,
-            )
+        elif split_name == "validation":
+            pre_encoded = validation_encoded
+
         else:
-            (
-                metrics,
-                encoded,
-                cca_analysis,
-            ) = evaluate_dataset(
-                model,
-                dataset,
-                train_encoded=train_encoded,
-                config=config,
-                device=device,
-            )
+            pre_encoded = None
 
-        results[
-            split_name
-        ] = metrics
+        metrics, encoded, cca_analysis = evaluate_dataset(
+            model,
+            dataset,
+            train_encoded=train_encoded,
+            config=config,
+            device=device,
+            pre_encoded=pre_encoded,
+        )
+
+        metrics.update(
+            audit.score(encoded)
+        )
+
+        metrics.update(
+            physical_audit.score(encoded)
+        )
+
+        results[split_name] = metrics
 
         if (
             config.save_latents
@@ -2493,9 +2148,7 @@ def evaluate_splits(
             cca_analysis is not None
             and config.output_dir is not None
         ):
-            output_dir = Path(
-                config.output_dir
-            )
+            output_dir = Path(config.output_dir)
 
             save_cca_analysis(
                 cca_analysis,
@@ -2518,66 +2171,42 @@ def evaluate_splits(
 # Evaluation artifact serialization
 # =============================================================================
 
-def save_encoded_dataset(
-    encoded: EncodedDataset,
-    path: Path | str,
-) -> Path:
-    """Save encoded representations and associated metadata."""
-    path = Path(path)
+def _json_safe_value(
+    value: MetricValue,
+) -> MetricValue:
+    """Convert non-finite values to JSON-safe null."""
+    if value is None:
+        return None
 
-    if path.suffix != ".npz":
-        path = path.with_suffix(
-            ".npz"
-        )
+    numeric = float(value)
 
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not np.isfinite(
+        numeric
+    ):
+        return None
 
-    arrays: dict[str, object] = {
-        "latent": encoded.latent,
-        "true_state": encoded.true_state,
-        "observation": encoded.observation,
-        "nuisance_id": encoded.nuisance_id,
-        "reconstructed_observation": (
-            encoded.reconstructed_observation
-        ),
-        "state_names": np.asarray(encoded.state_names, dtype="U"),
-        "episode_index": encoded.episode_index,
-        "time_index": encoded.time_index,
+    return numeric
+
+
+def _json_safe_results(
+    results: Mapping[
+        str,
+        Mapping[str, MetricValue],
+    ],
+) -> dict[
+    str,
+    dict[str, MetricValue],
+]:
+    """Convert nested metric dictionaries to JSON-safe values."""
+    return {
+        split_name: {
+            metric_name: _json_safe_value(
+                value
+            )
+            for metric_name, value in metrics.items()
+        }
+        for split_name, metrics in results.items()
     }
-
-    if encoded.nuisance is not None:
-        arrays["nuisance"] = (
-            encoded.nuisance
-        )
-
-    optional_arrays = {
-        "counterfactual_observation": (
-            encoded.counterfactual_observation
-        ),
-        "counterfactual_latent": (
-            encoded.counterfactual_latent
-        ),
-        "predicted_next_latent": (
-            encoded.predicted_next_latent
-        ),
-        "nuisance_logits": (
-            encoded.nuisance_logits
-        ),
-    }
-
-    for name, value in optional_arrays.items():
-        if value is not None:
-            arrays[name] = value
-
-    np.savez_compressed(
-        path,
-        **arrays,
-    )
-
-    return path
 
 
 def save_cca_analysis(
@@ -2637,72 +2266,61 @@ def save_cca_analysis(
     return path
 
 
-def _json_safe_value(
-    value: MetricValue,
-) -> MetricValue:
-    """Convert non-finite values to JSON-safe null."""
-    if value is None:
-        return None
-
-    numeric = float(value)
-
-    if not np.isfinite(
-        numeric
-    ):
-        return None
-
-    return numeric
-
-
-def _json_safe_results(
-    results: Mapping[
-        str,
-        Mapping[str, MetricValue],
-    ],
-) -> dict[
-    str,
-    dict[str, MetricValue],
-]:
-    """Convert nested metric dictionaries to JSON-safe values."""
-    return {
-        split_name: {
-            metric_name: _json_safe_value(
-                value
-            )
-            for metric_name, value in metrics.items()
-        }
-        for split_name, metrics in results.items()
-    }
-
-
-def save_results_json(
-    results: Mapping[
-        str,
-        Mapping[str, MetricValue],
-    ],
+def save_encoded_dataset(
+    encoded: EncodedDataset,
     path: Path | str,
 ) -> Path:
-    """Save nested split metrics to JSON."""
+    """Save encoded representations and associated metadata."""
     path = Path(path)
+
+    if path.suffix != ".npz":
+        path = path.with_suffix(
+            ".npz"
+        )
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with path.open(
-        "w",
-        encoding="utf-8",
-    ) as stream:
-        json.dump(
-            _json_safe_results(
-                results
-            ),
-            stream,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
+    arrays: dict[str, object] = {
+        "latent": encoded.latent,
+        "true_state": encoded.true_state,
+        "observation": encoded.observation,
+        "nuisance_id": encoded.nuisance_id,
+        "reconstructed_observation": (
+            encoded.reconstructed_observation
+        ),
+        "state_names": np.asarray(encoded.state_names, dtype="U"),
+        "episode_index": encoded.episode_index,
+        "time_index": encoded.time_index,
+    }
+
+    if encoded.nuisance is not None:
+        arrays["nuisance"] = (
+            encoded.nuisance
         )
+
+    optional_arrays = {
+        "counterfactual_observation": (
+            encoded.counterfactual_observation
+        ),
+        "counterfactual_latent": (
+            encoded.counterfactual_latent
+        ),
+        "predicted_next_latent": (
+            encoded.predicted_next_latent
+        ),
+    }
+
+    for name, value in optional_arrays.items():
+        if value is not None:
+            arrays[name] = value
+
+    np.savez_compressed(
+        path,
+        **arrays,
+    )
 
     return path
 
@@ -2761,72 +2379,41 @@ def save_results_csv(
     return path
 
 
-# =============================================================================
-# Reporting and aggregation
-# =============================================================================
-
-def print_compact_evaluation_summary(
-    run_name: str,
+def save_results_json(
     results: Mapping[
         str,
         Mapping[str, MetricValue],
     ],
-    state_names: tuple[str, ...],
-) -> None:
-    """Print principal comparable metrics."""
-    selected_metrics = [
-        "observation_mse",
-        "rollout_observation_mse_h5",
-        "rollout_latent_mse_h5",
-        "state_linearity_gap",
-        "state_cca_mean_correlation",
-        "state_cca_min_correlation",
-        "neighborhood_trustworthiness",
-        "counterfactual_normalized_mse",
-        "conditional_nuisance_probe_accuracy",
-        "state_probe_r2",
-        "temporal_state_probe_r2",
-    ]
-    for state_name in state_names:
-        selected_metrics.append(f"state_probe_r2_{state_name}")
-        selected_metrics.append(f"temporal_state_probe_r2_{state_name}")
-        
+    path: Path | str,
+) -> Path:
+    """Save nested split metrics to JSON."""
+    path = Path(path)
 
-    print()
-    print(
-        f"Evaluation summary: {run_name}"
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    print_separator("-")
 
-    for split_name in (
-        "test",
-        "ood",
-    ):
-        if split_name not in results:
-            continue
-
-        print(
-            split_name.upper()
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as stream:
+        json.dump(
+            _json_safe_results(
+                results
+            ),
+            stream,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
         )
 
-        for metric_name in selected_metrics:
-            value = results[
-                split_name
-            ].get(
-                metric_name
-            )
+    return path
 
-            if value is None:
-                print(
-                    f"  {metric_name:<42} {'N/A':>12}"
-                )
-            else:
-                print(
-                    f"  {metric_name:<42} {value:>12.6f}"
-                )
 
-    print_separator("-")
-
+# =============================================================================
+# Reporting and aggregation
+# =============================================================================
 
 def aggregate_seed_results(
     seed_results: Mapping[
@@ -2952,6 +2539,69 @@ def aggregate_seed_results(
     return aggregated
 
 
+def print_compact_evaluation_summary(
+    run_name: str,
+    results: Mapping[
+        str,
+        Mapping[str, MetricValue],
+    ],
+    state_names: tuple[str, ...],
+) -> None:
+    """Print principal comparable metrics."""
+    selected_metrics = [
+        "observation_mse",
+        "rollout_observation_mse_h5",
+        "rollout_latent_mse_h5",
+        "state_linearity_gap",
+        "state_cca_mean_correlation",
+        "state_cca_min_correlation",
+        "neighborhood_trustworthiness",
+        "counterfactual_relative_energy",
+        "nuisance_latent_strong_class_balanced_accuracy",
+        "state_probe_r2",
+        "temporal_state_probe_r2",
+    ]
+    for state_name in state_names:
+        selected_metrics.append(f"state_probe_r2_{state_name}")
+        selected_metrics.append(f"temporal_state_probe_r2_{state_name}")
+        
+
+    print()
+    print(
+        f"Evaluation summary: {run_name}"
+    )
+    print_separator("-")
+
+    for split_name in (
+        "test",
+        "ood",
+    ):
+        if split_name not in results:
+            continue
+
+        print(
+            split_name.upper()
+        )
+
+        for metric_name in selected_metrics:
+            value = results[
+                split_name
+            ].get(
+                metric_name
+            )
+
+            if value is None:
+                print(
+                    f"  {metric_name:<42} {'N/A':>12}"
+                )
+            else:
+                print(
+                    f"  {metric_name:<42} {value:>12.6f}"
+                )
+
+    print_separator("-")
+
+
 # =============================================================================
 # Command-line configuration
 # =============================================================================
@@ -3017,83 +2667,79 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
+        default=DEFAULT_BATCH_SIZE,
     )
 
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=0,
+        default=DEFAULT_NUM_WORKERS,
     )
 
     parser.add_argument(
         "--device",
-        default="auto",
+        default=DEFAULT_DEVICE,
     )
 
     parser.add_argument(
         "--rollout-horizons",
         type=int,
         nargs="+",
-        default=[
-            1,
-            5,
-            10,
-        ],
+        default=list(DEFAULT_ROLLOUT_HORIZONS),
     )
 
     parser.add_argument(
         "--probe-max-samples",
         type=int,
-        default=100_000,
+        default=DEFAULT_PROBE_MAX_SAMPLES,
     )
 
     parser.add_argument(
         "--nonlinear-probe-max-samples",
         type=int,
-        default=25_000,
+        default=DEFAULT_NONLINEAR_PROBE_MAX_SAMPLES,
     )
 
     parser.add_argument(
         "--temporal-probe-max-samples",
         type=int,
-        default=100_000,
+        default=DEFAULT_TEMPORAL_PROBE_MAX_SAMPLES,
     )
 
     parser.add_argument(
         "--cca-max-samples",
         type=int,
-        default=50_000,
+        default=DEFAULT_CCA_MAX_SAMPLES,
     )
 
     parser.add_argument(
         "--cca-max-iter",
         type=int,
-        default=2_000,
+        default=DEFAULT_CCA_MAX_ITERATIONS,
     )
 
     parser.add_argument(
         "--cca-tolerance",
         type=float,
-        default=1e-6,
+        default=DEFAULT_CCA_TOLERANCE,
     )
 
     parser.add_argument(
         "--neighborhood-max-samples",
         type=int,
-        default=5_000,
+        default=DEFAULT_NEIGHBORHOOD_MAX_SAMPLES,
     )
 
     parser.add_argument(
         "--neighborhood-neighbors",
         type=int,
-        default=15,
+        default=DEFAULT_NEIGHBORHOOD_NEIGHBORS,
     )
 
     parser.add_argument(
         "--probe-seed",
         type=int,
-        default=42,
+        default=DEFAULT_PROBE_SEED,
     )
 
     parser.add_argument(
@@ -3106,93 +2752,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
 
+    parser.add_argument(
+        "--nuisance-probe-epochs",
+        type=int,
+        default=DEFAULT_NUISANCE_PROBE_EPOCHS,
+        help="Maximum independent nuisance-probe epochs."
+    )
+
+    parser.add_argument(
+        "--probe-workers",
+        type=int,
+        default=DEFAULT_PROBE_WORKERS,
+    )
+
+    parser.add_argument(
+        "--probe-profile",
+        choices=PROBE_PROFILES,
+        default=DEFAULT_PROBE_PROFILE,
+    )
+
+    parser.add_argument(
+        "--probe-cache-dir",
+        default=DEFAULT_PROBE_CACHE_DIR,
+        help=(
+           "Shared local cache; empty string disables caching."
+        ),
+    )
+
+    parser.add_argument(
+        "--strong-probe-epochs",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--physical-probe-epochs",
+        type=int,
+        default=None,
+    )
     return parser
 
 
 # =============================================================================
 # Checkpoint evaluation orchestration
 # =============================================================================
-
-def resolve_evaluation_seeds(
-    args: argparse.Namespace,
-) -> list[int | None]:
-    """Resolve single-checkpoint and multi-seed evaluation modes."""
-    if args.checkpoint is not None:
-        if args.checkpoint_template is not None:
-            raise ValueError(
-                "Use either --checkpoint or --checkpoint-template, "
-                "not both."
-            )
-
-        if (
-            args.seed is not None
-            or args.seeds is not None
-        ):
-            raise ValueError(
-                "--seed/--seeds require --checkpoint-template."
-            )
-
-        return [
-            None
-        ]
-
-    if args.checkpoint_template is None:
-        raise ValueError(
-            "Provide either --checkpoint or --checkpoint-template."
-        )
-
-    if (
-        args.seed is not None
-        and args.seeds is not None
-    ):
-        raise ValueError(
-            "Use either --seed or --seeds, not both."
-        )
-
-    if args.seeds is not None:
-        seeds = list(
-            args.seeds
-        )
-    elif args.seed is not None:
-        seeds = [
-            args.seed
-        ]
-    else:
-        raise ValueError(
-            "--checkpoint-template requires --seed or --seeds."
-        )
-
-    if len(
-        set(seeds)
-    ) != len(seeds):
-        raise ValueError(
-            "Seeds must be unique."
-        )
-
-    return seeds
-
-
-def format_checkpoint_path(
-    template: str,
-    seed: int,
-) -> Path:
-    """Format one checkpoint path from a seed template."""
-    if "{}" in template:
-        return Path(
-            template.format(seed)
-        )
-
-    if "{seed}" in template:
-        return Path(
-            template.format(
-                seed=seed
-            )
-        )
-
-    raise ValueError(
-        "--checkpoint-template must contain '{}' or '{seed}'."
-    )
-
 
 def evaluate_one_checkpoint(
     *,
@@ -3202,7 +2805,7 @@ def evaluate_one_checkpoint(
     device: torch.device,
 ) -> dict[str, MetricDict]:
     """Evaluate one checkpoint and save all artifacts."""
-    model, checkpoint = load_checkpoint_model(
+    model, _ = load_checkpoint_model(
         checkpoint_path,
         device=device,
     )
@@ -3265,10 +2868,38 @@ def evaluate_one_checkpoint(
             args.neighborhood_neighbors
         ),
         probe_seed=args.probe_seed,
+        nuisance_probe_epochs=args.nuisance_probe_epochs,
+        strong_probe_epochs=args.strong_probe_epochs,
+        physical_probe_epochs=args.physical_probe_epochs,
+        probe_workers=args.probe_workers,
+        probe_profile=args.probe_profile,
+        probe_cache_dir=args.probe_cache_dir or None,
         save_latents=args.save_latents,
         output_dir=str(
             output_dir
         ),
+    )
+
+    evaluation_protocol = {
+        "probe_profile": config.probe_profile,
+        "nuisance_probe_epochs": config.nuisance_probe_epochs,
+        "strong_probe_epochs": config.strong_probe_epochs,
+        "physical_probe_epochs": config.physical_probe_epochs,
+        "probe_seed": config.probe_seed,
+        "nonlinear_probe_max_samples": (
+            config.nonlinear_probe_max_samples
+        ),
+    }
+
+    (
+        output_dir
+        / "evaluation_protocol.json"
+    ).write_text(
+        json.dumps(
+            evaluation_protocol,
+            indent=2,
+        )
+        + "\n"
     )
 
     results = evaluate_splits(
@@ -3297,6 +2928,87 @@ def evaluate_one_checkpoint(
     )
 
     return results
+
+
+def format_checkpoint_path(
+    template: str,
+    seed: int,
+) -> Path:
+    """Format one checkpoint path from a seed template."""
+    if "{}" in template:
+        return Path(
+            template.format(seed)
+        )
+
+    if "{seed}" in template:
+        return Path(
+            template.format(
+                seed=seed
+            )
+        )
+
+    raise ValueError(
+        "--checkpoint-template must contain '{}' or '{seed}'."
+    )
+
+
+def resolve_evaluation_seeds(
+    args: argparse.Namespace,
+) -> list[int | None]:
+    """Resolve single-checkpoint and multi-seed evaluation modes."""
+    if args.checkpoint is not None:
+        if args.checkpoint_template is not None:
+            raise ValueError(
+                "Use either --checkpoint or --checkpoint-template, "
+                "not both."
+            )
+
+        if (
+            args.seed is not None
+            or args.seeds is not None
+        ):
+            raise ValueError(
+                "--seed/--seeds require --checkpoint-template."
+            )
+
+        return [
+            None
+        ]
+
+    if args.checkpoint_template is None:
+        raise ValueError(
+            "Provide either --checkpoint or --checkpoint-template."
+        )
+
+    if (
+        args.seed is not None
+        and args.seeds is not None
+    ):
+        raise ValueError(
+            "Use either --seed or --seeds, not both."
+        )
+
+    if args.seeds is not None:
+        seeds = list(
+            args.seeds
+        )
+    elif args.seed is not None:
+        seeds = [
+            args.seed
+        ]
+    else:
+        raise ValueError(
+            "--checkpoint-template requires --seed or --seeds."
+        )
+
+    if len(
+        set(seeds)
+    ) != len(seeds):
+        raise ValueError(
+            "Seeds must be unique."
+        )
+
+    return seeds
 
 
 # =============================================================================
@@ -3458,13 +3170,13 @@ def main() -> None:
             "observation_mse",
             "rollout_observation_mse_h5",
             "rollout_latent_mse_h5",
-            "counterfactual_normalized_mse",
+            "counterfactual_relative_energy",
             "state_probe_r2",
             "temporal_state_probe_r2",
             "state_cca_mean_correlation",
             "state_linearity_gap",
             "neighborhood_trustworthiness",
-            "conditional_nuisance_probe_accuracy",
+            "nuisance_latent_strong_class_balanced_accuracy",
         )
 
         for split_name in (

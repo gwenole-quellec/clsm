@@ -4,7 +4,7 @@ Loss functions for CLSM.
 Author: Gwenolé Quellec
 Year: 2026
 
-This module implements modular PyTorch losses corresponding to the six
+This module implements modular PyTorch losses used to instantiate the six
 constraints described in Constrained Latent State Modeling (CLSM):
 
 1. predictive sufficiency;
@@ -15,17 +15,25 @@ constraints described in Constrained Latent State Modeling (CLSM):
 6. structural constraints.
 
 The functions are architecture-agnostic. They operate on tensors produced by
-any encoder, decoder, transition model or adversarial nuisance predictor.
+encoders, decoders, transition models, or nuisance predictors and can be
+combined with different training procedures.
 
 Notes
 -----
-The losses in this file are practical surrogates for conceptual constraints.
-For example, predictive sufficiency and minimality are information-theoretic
-properties, but are approximated here through prediction errors, bottleneck
-penalties, and optional variational regularization. Invariance is implemented
-through adversarial nuisance prediction: the nuisance classifier minimizes a
-classification loss, while a gradient-reversal layer in the model sends the
-opposite gradient to the encoder.
+The losses in this file are practical surrogates for conceptual representation
+properties, not direct tests that those properties have been achieved. For
+example, predictive sufficiency and minimality are information-theoretic
+notions but are approximated here through prediction objectives, bottleneck
+penalties, and optional variational regularization.
+
+Adversarial invariance is handled by the training procedure rather than by a
+dedicated loss function in this module. The nuisance adversary is optimized
+separately from the encoder through alternating updates, and its objective is
+supplied to ``CLSMLoss`` as the invariance component.
+
+Training losses should not be interpreted as evaluation metrics. Learned
+representations are evaluated separately using independent probes and
+representation-level diagnostics.
 """
 
 from __future__ import annotations
@@ -48,6 +56,19 @@ def _check_same_shape(a: Tensor, b: Tensor, name_a: str, name_b: str) -> None:
             f"{name_a} and {name_b} must have the same shape, "
             f"got {tuple(a.shape)} and {tuple(b.shape)}."
         )
+
+
+def _flatten_features(x: Tensor) -> Tensor:
+    """
+    Flatten every axis except the last feature axis.
+
+    Examples
+    --------
+    ``(batch, time, features) -> (batch * time, features)``
+    """
+    if x.ndim < 2:
+        raise ValueError("Expected a tensor with at least two dimensions.")
+    return x.reshape(-1, x.shape[-1])
 
 
 def _masked_mean(values: Tensor, mask: Tensor | None = None) -> Tensor:
@@ -77,22 +98,104 @@ def _masked_mean(values: Tensor, mask: Tensor | None = None) -> Tensor:
     return weighted.sum() / denominator
 
 
-def _flatten_features(x: Tensor) -> Tensor:
-    """
-    Flatten every axis except the last feature axis.
-
-    Examples
-    --------
-    ``(batch, time, features) -> (batch * time, features)``
-    """
-    if x.ndim < 2:
-        raise ValueError("Expected a tensor with at least two dimensions.")
-    return x.reshape(-1, x.shape[-1])
-
-
 # =============================================================================
 # Core CLSM losses
 # =============================================================================
+
+def minimality_loss(
+    latent: Tensor,
+    *,
+    mode: str = "participation_ratio",
+    mean: Tensor | None = None,
+    log_variance: Tensor | None = None,
+    eps: float = 1e-8,
+) -> Tensor:
+    """
+    Encourage low effective dimensionality or regularized latent activations.
+
+    Modes
+    -----
+    ``"participation_ratio"``
+        Minimize the effective latent dimensionality by penalizing the
+        participation ratio of the latent covariance.
+
+    ``"l1"``
+        Mean absolute activation.
+
+    ``"kl"``
+        KL divergence from a diagonal Gaussian posterior to a unit Gaussian.
+        Requires ``mean`` and ``log_variance``.
+    """
+    if mode == "participation_ratio":
+        flat = _flatten_features(latent)
+        flat = flat - flat.mean(dim=0, keepdim=True)
+
+        latent_dim = flat.shape[-1]
+        if latent_dim <= 1:
+            return flat.new_zeros(())
+
+        covariance = (
+            flat.T @ flat
+        ) / max(flat.shape[0] - 1, 1)
+
+        eigenvalues = torch.linalg.eigvalsh(
+            covariance
+        ).clamp_min(0.0)
+
+        total_variance = eigenvalues.sum()
+
+        # A fully collapsed representation has zero effective dimensionality.
+        if total_variance <= eps:
+            return total_variance.new_zeros(())
+
+        denominator = eigenvalues.pow(2).sum()
+        if denominator <= eps:
+            return denominator.new_zeros(())
+
+        participation_ratio = total_variance.pow(2) / denominator
+
+        normalized_participation_ratio = (
+            participation_ratio - 1.0
+        ) / (
+            latent_dim - 1.0
+        )
+
+        return normalized_participation_ratio.clamp(
+            min=0.0,
+            max=1.0,
+        )
+
+    if mode == "l1":
+        return latent.abs().mean()
+
+    if mode == "kl":
+        if mean is None or log_variance is None:
+            raise ValueError(
+                "mean and log_variance are required for KL minimality."
+            )
+
+        _check_same_shape(
+            mean,
+            log_variance,
+            "mean",
+            "log_variance",
+        )
+
+        kl_per_element = -0.5 * (
+            1.0
+            + log_variance
+            - mean.pow(2)
+            - log_variance.exp()
+        )
+
+        return kl_per_element.mean()
+
+    raise ValueError(
+        "mode must be one of "
+        "{'participation_ratio', "
+        "'l1', 'kl'}."
+    )
+
 
 def observation_compatibility_loss(
     reconstructed_observation: Tensor,
@@ -246,263 +349,6 @@ def predictive_sufficiency_loss(
     )
 
 
-def temporal_coherence_loss(
-    latent_state: Tensor,
-    *,
-    predicted_next_latent: Tensor | None = None,
-    mode: str = "velocity",
-    mask: Tensor | None = None,
-) -> Tensor:
-    """Encourage coherent latent trajectories."""
-    if latent_state.ndim < 3:
-        raise ValueError(
-            "latent_state must have shape (..., time, latent_dim)."
-        )
-
-    if mode == "velocity":
-        if latent_state.shape[-2] < 2:
-            raise ValueError(
-                "At least two time points are required in velocity mode."
-            )
-        velocity = (
-            latent_state[..., 1:, :]
-            - latent_state[..., :-1, :]
-        )
-        values = velocity.pow(2)
-
-    elif mode == "dynamics":
-        if predicted_next_latent is None:
-            raise ValueError(
-                "predicted_next_latent is required in dynamics mode."
-            )
-        # Preserve gradients through the target latent trajectory so that temporal
-        # consistency also shapes the encoder representation.
-        target_next = latent_state[..., 1:, :]
-        _check_same_shape(
-            predicted_next_latent,
-            target_next,
-            "predicted_next_latent",
-            "latent_state[..., 1:, :]",
-        )
-        values = (predicted_next_latent - target_next).pow(2)
-
-    elif mode == "acceleration":
-        if latent_state.shape[-2] < 3:
-            raise ValueError(
-                "At least three time points are required in acceleration mode."
-            )
-        acceleration = (
-            latent_state[..., 2:, :]
-            - 2.0 * latent_state[..., 1:-1, :]
-            + latent_state[..., :-2, :]
-        )
-        values = acceleration.pow(2)
-
-    else:
-        raise ValueError(
-            "mode must be 'velocity', 'dynamics', or 'acceleration'."
-        )
-
-    return _masked_mean(values, mask)
-
-
-def nuisance_adversarial_loss(
-    nuisance_logits: Tensor,
-    nuisance_id: Tensor,
-) -> Tensor:
-    """
-    Compute the nuisance-classification loss used by the adversary.
-
-    The model applies gradient reversal before the nuisance classifier.
-    Consequently, minimizing this cross-entropy trains the classifier to
-    recover nuisance identity while encouraging the encoder to remove
-    nuisance-related information.
-
-    Parameters
-    ----------
-    nuisance_logits:
-        Class logits of shape ``(..., n_nuisances)``. In the standard
-        sequence setting, the expected shape is
-        ``(batch, time, n_nuisances)``.
-    nuisance_id:
-        Episode-level nuisance labels. Accepted shapes are ``(batch,)`` or
-        any shape matching ``nuisance_logits.shape[:-1]``.
-
-    Returns
-    -------
-    Tensor
-        Scalar cross-entropy loss.
-    """
-    if nuisance_logits.ndim < 2:
-        raise ValueError(
-            "nuisance_logits must have shape (..., n_nuisances)."
-        )
-
-    target_shape = nuisance_logits.shape[:-1]
-    labels = nuisance_id.long()
-
-    if labels.shape == target_shape:
-        expanded_labels = labels
-    elif labels.ndim == 1 and labels.shape[0] == target_shape[0]:
-        view_shape = (
-            labels.shape[0],
-            *([1] * (len(target_shape) - 1)),
-        )
-        expanded_labels = labels.reshape(view_shape).expand(target_shape)
-    else:
-        raise ValueError(
-            "nuisance_id must either match nuisance_logits.shape[:-1] "
-            "or contain one episode-level label per batch element. "
-            f"Got logits shape {tuple(nuisance_logits.shape)} and "
-            f"label shape {tuple(labels.shape)}."
-        )
-
-    flat_logits = nuisance_logits.reshape(
-        -1,
-        nuisance_logits.shape[-1],
-    )
-    flat_labels = expanded_labels.reshape(-1)
-
-    return F.cross_entropy(
-        flat_logits,
-        flat_labels,
-    )
-
-
-def nuisance_adversarial_accuracy(
-    nuisance_logits: Tensor,
-    nuisance_id: Tensor,
-) -> Tensor:
-    """
-    Compute nuisance-classification accuracy for training diagnostics.
-
-    This function is not part of the optimization objective. Chance-level
-    accuracy indicates that nuisance identity is difficult to recover from the
-    latent representation, provided that the classifier itself is adequately
-    optimized.
-    """
-    if nuisance_logits.ndim < 2:
-        raise ValueError(
-            "nuisance_logits must have shape (..., n_nuisances)."
-        )
-
-    target_shape = nuisance_logits.shape[:-1]
-    labels = nuisance_id.long()
-
-    if labels.shape == target_shape:
-        expanded_labels = labels
-    elif labels.ndim == 1 and labels.shape[0] == target_shape[0]:
-        view_shape = (
-            labels.shape[0],
-            *([1] * (len(target_shape) - 1)),
-        )
-        expanded_labels = labels.reshape(view_shape).expand(target_shape)
-    else:
-        raise ValueError(
-            "nuisance_id shape is incompatible with nuisance_logits."
-        )
-
-    predictions = nuisance_logits.argmax(dim=-1)
-    return (
-        predictions == expanded_labels
-    ).float().mean()
-
-
-def minimality_loss(
-    latent: Tensor,
-    *,
-    mode: str = "participation_ratio",
-    mean: Tensor | None = None,
-    log_variance: Tensor | None = None,
-    eps: float = 1e-8,
-) -> Tensor:
-    """
-    Encourage low effective dimensionality or regularized latent activations.
-
-    Modes
-    -----
-    ``"participation_ratio"``
-        Minimize the effective latent dimensionality by penalizing the
-        participation ratio of the latent covariance.
-
-    ``"l1"``
-        Mean absolute activation.
-
-    ``"kl"``
-        KL divergence from a diagonal Gaussian posterior to a unit Gaussian.
-        Requires ``mean`` and ``log_variance``.
-    """
-    if mode == "participation_ratio":
-        flat = _flatten_features(latent)
-        flat = flat - flat.mean(dim=0, keepdim=True)
-
-        latent_dim = flat.shape[-1]
-        if latent_dim <= 1:
-            return flat.new_zeros(())
-
-        covariance = (
-            flat.T @ flat
-        ) / max(flat.shape[0] - 1, 1)
-
-        eigenvalues = torch.linalg.eigvalsh(
-            covariance
-        ).clamp_min(0.0)
-
-        total_variance = eigenvalues.sum()
-
-        # A fully collapsed representation has zero effective dimensionality.
-        if total_variance <= eps:
-            return total_variance.new_zeros(())
-
-        denominator = eigenvalues.pow(2).sum()
-        if denominator <= eps:
-            return denominator.new_zeros(())
-
-        participation_ratio = total_variance.pow(2) / denominator
-
-        normalized_participation_ratio = (
-            participation_ratio - 1.0
-        ) / (
-            latent_dim - 1.0
-        )
-
-        return normalized_participation_ratio.clamp(
-            min=0.0,
-            max=1.0,
-        )
-
-    if mode == "l1":
-        return latent.abs().mean()
-
-    if mode == "kl":
-        if mean is None or log_variance is None:
-            raise ValueError(
-                "mean and log_variance are required for KL minimality."
-            )
-
-        _check_same_shape(
-            mean,
-            log_variance,
-            "mean",
-            "log_variance",
-        )
-
-        kl_per_element = -0.5 * (
-            1.0
-            + log_variance
-            - mean.pow(2)
-            - log_variance.exp()
-        )
-
-        return kl_per_element.mean()
-
-    raise ValueError(
-        "mode must be one of "
-        "{'participation_ratio', "
-        "'l1', 'kl'}."
-    )
-
-
 def structural_constraint_loss(
     latent: Tensor,
     *,
@@ -582,6 +428,66 @@ def structural_constraint_loss(
     )
 
 
+def temporal_coherence_loss(
+    latent_state: Tensor,
+    *,
+    predicted_next_latent: Tensor | None = None,
+    mode: str = "velocity",
+    mask: Tensor | None = None,
+) -> Tensor:
+    """Encourage coherent latent trajectories."""
+    if latent_state.ndim < 3:
+        raise ValueError(
+            "latent_state must have shape (..., time, latent_dim)."
+        )
+
+    if mode == "velocity":
+        if latent_state.shape[-2] < 2:
+            raise ValueError(
+                "At least two time points are required in velocity mode."
+            )
+        velocity = (
+            latent_state[..., 1:, :]
+            - latent_state[..., :-1, :]
+        )
+        values = velocity.pow(2)
+
+    elif mode == "dynamics":
+        if predicted_next_latent is None:
+            raise ValueError(
+                "predicted_next_latent is required in dynamics mode."
+            )
+        # Preserve gradients through the target latent trajectory so that temporal
+        # consistency also shapes the encoder representation.
+        target_next = latent_state[..., 1:, :]
+        _check_same_shape(
+            predicted_next_latent,
+            target_next,
+            "predicted_next_latent",
+            "latent_state[..., 1:, :]",
+        )
+        values = (predicted_next_latent - target_next).pow(2)
+
+    elif mode == "acceleration":
+        if latent_state.shape[-2] < 3:
+            raise ValueError(
+                "At least three time points are required in acceleration mode."
+            )
+        acceleration = (
+            latent_state[..., 2:, :]
+            - 2.0 * latent_state[..., 1:-1, :]
+            + latent_state[..., :-2, :]
+        )
+        values = acceleration.pow(2)
+
+    else:
+        raise ValueError(
+            "mode must be 'velocity', 'dynamics', or 'acceleration'."
+        )
+
+    return _masked_mean(values, mask)
+
+
 # =============================================================================
 # Weighted CLSM objective
 # =============================================================================
@@ -619,9 +525,8 @@ class CLSMLoss(nn.Module):
 
     This class intentionally does not infer which tensors should be compared.
     The training code computes each relevant component using the functions in
-    this module, then passes them here. The ``invariance`` component is the
-    nuisance-adversarial cross-entropy; gradient reversal is implemented in
-    the model rather than in this loss aggregator.
+    this module, then passes them here. The ``invariance`` component is supplied
+    by the training procedure from the separately optimized nuisance adversary.
 
     Example
     -------

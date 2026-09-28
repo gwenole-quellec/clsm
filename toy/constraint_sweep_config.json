@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "focus_centers": [
+    {
+      "pilot_id": 62,
+      "weights": {
+        "predictive": 0.7704888097391407,
+        "minimality": 0.00013772527381799543,
+        "temporal": 0.5103974199972413,
+        "observation": 0.0,
+        "invariance": 0.0,
+        "structural": 0.005594284069090017
+      }
+    },
+    {
+      "pilot_id": 68,
+      "weights": {
+        "predictive": 0.1780714270272767,
+        "minimality": 0.0,
+        "temporal": 0.8294465727990151,
+        "observation": 0.01603664755949637,
+        "invariance": 0.035529386306346465,
+        "structural": 0.014861469547105505
+      }
+    },
+    {
+      "pilot_id": 85,
+      "weights": {
+        "predictive": 0.061014146092951804,
+        "minimality": 5.3771116679615836e-05,
+        "temporal": 0.8556880270448219,
+        "observation": 0.0,
+        "invariance": 0.02251538488839308,
+        "structural": 0.011192191152638902
+      }
+    },
+    {
+      "pilot_id": 54,
+      "weights": {
+        "predictive": 1.759513459325924,
+        "minimality": 1.1914011251656582e-05,
+        "temporal": 0.038625759266892414,
+        "observation": 1.96024849587137,
+        "invariance": 0.015356292988543145,
+        "structural": 0.004004299102381176
+      }
+    },
+    {
+      "pilot_id": 61,
+      "weights": {
+        "predictive": 0.988519926236099,
+        "minimality": 0.0,
+        "temporal": 1.81893915684284,
+        "observation": 0.260345001929223,
+        "invariance": 0.1549894099729583,
+        "structural": 0.04319691687306697
+      }
+    },
+    {
+      "pilot_id": 49,
+      "weights": {
+        "predictive": 0.07815757014161018,
+        "minimality": 8.602540849494627e-05,
+        "temporal": 0.743936786657059,
+        "observation": 0.015268226447822676,
+        "invariance": 0.03704421768247353,
+        "structural": 0.0717952245198596
+      }
+    },
+    {
+      "pilot_id": 110,
+      "weights": {
+        "predictive": 0.2100388730259801,
+        "minimality": 2.548392092912347e-05,
+        "temporal": 0.6800550654048245,
+        "observation": 0.038813962520392625,
+        "invariance": 0.09744214267490654,
+        "structural": 0.0069316950427982995
+      }
+    },
+    {
+      "pilot_id": 111,
+      "weights": {
+        "predictive": 0.01,
+        "minimality": 5.3771116679615836e-05,
+        "temporal": 0.8556880270448219,
+        "observation": 0.0,
+        "invariance": 0.02251538488839308,
+        "structural": 0.011192191152638902
+      }
+    },
+    {
+      "pilot_id": 114,
+      "weights": {
+        "predictive": 0.061014146092951804,
+        "minimality": 5.3771116679615836e-05,
+        "temporal": 0.8556880270448219,
+        "observation": 0.0,
+        "invariance": 0.01,
+        "structural": 0.011192191152638902
+      }
+    }
+  ]
+}

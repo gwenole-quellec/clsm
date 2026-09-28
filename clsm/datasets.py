@@ -1,6 +1,9 @@
 """
 Generic dataset utilities for CLSM experiments.
 
+Author: Gwenolé Quellec
+Year: 2026
+
 This module converts episodes produced by any compatible CLSM environment
 into serializable train, validation, test, and optional OOD datasets.
 """
@@ -403,25 +406,6 @@ class DatasetSplits:
         return paths
 
 
-@dataclass(frozen=True)
-class PredictionWindows:
-    """Temporal prediction windows extracted from a CLSMDataset."""
-
-    context_observation: FloatArray
-    future_observation: FloatArray
-    context_latent_state: FloatArray
-    future_latent_state: FloatArray
-    nuisance: FloatArray
-    nuisance_id: IntArray
-    episode_index: IntArray
-    start_index: IntArray
-    counterfactual_context_observation: FloatArray | None = None
-    counterfactual_future_observation: FloatArray | None = None
-
-    def __len__(self) -> int:
-        return int(self.context_observation.shape[0])
-
-
 # =============================================================================
 # Dataset generation
 # =============================================================================
@@ -586,98 +570,6 @@ def generate_splits(
         validation=validation,
         test=test,
         ood=ood,
-    )
-
-
-# =============================================================================
-# Dataset transformations
-# =============================================================================
-
-def make_prediction_windows(
-    dataset: CLSMDataset,
-    *,
-    context_length: int,
-    horizon: int = 1,
-    stride: int = 1,
-) -> PredictionWindows:
-    if context_length < 1:
-        raise ValueError("context_length must be at least 1.")
-    if horizon < 1:
-        raise ValueError("horizon must be at least 1.")
-    if stride < 1:
-        raise ValueError("stride must be at least 1.")
-
-    required_length = context_length + horizon
-    if required_length > dataset.episode_length:
-        raise ValueError(
-            "context_length + horizon cannot exceed episode length."
-        )
-
-    contexts_obs = []
-    futures_obs = []
-    contexts_state = []
-    futures_state = []
-    nuisances = []
-    nuisance_ids = []
-    episode_indices = []
-    start_indices = []
-
-    cf_contexts_obs = [] if dataset.has_counterfactuals else None
-    cf_futures_obs = [] if dataset.has_counterfactuals else None
-
-    final_start = dataset.episode_length - required_length
-
-    for episode_index in range(dataset.n_episodes):
-        for start in range(0, final_start + 1, stride):
-            split = start + context_length
-            end = split + horizon
-
-            contexts_obs.append(
-                dataset.observation[episode_index, start:split]
-            )
-            futures_obs.append(
-                dataset.observation[episode_index, split:end]
-            )
-            contexts_state.append(
-                dataset.latent_state[episode_index, start:split]
-            )
-            futures_state.append(
-                dataset.latent_state[episode_index, split:end]
-            )
-            nuisances.append(dataset.nuisance[episode_index])
-            nuisance_ids.append(dataset.nuisance_id[episode_index])
-            episode_indices.append(episode_index)
-            start_indices.append(start)
-
-            if dataset.has_counterfactuals:
-                cf_contexts_obs.append(
-                    dataset.counterfactual_observation[
-                        episode_index,
-                        start:split,
-                    ]
-                )
-                cf_futures_obs.append(
-                    dataset.counterfactual_observation[
-                        episode_index,
-                        split:end,
-                    ]
-                )
-
-    return PredictionWindows(
-        context_observation=np.stack(contexts_obs),
-        future_observation=np.stack(futures_obs),
-        context_latent_state=np.stack(contexts_state),
-        future_latent_state=np.stack(futures_state),
-        nuisance=np.asarray(nuisances, dtype=np.float64),
-        nuisance_id=np.asarray(nuisance_ids, dtype=np.int64),
-        episode_index=np.asarray(episode_indices, dtype=np.int64),
-        start_index=np.asarray(start_indices, dtype=np.int64),
-        counterfactual_context_observation=(
-            None if cf_contexts_obs is None else np.stack(cf_contexts_obs)
-        ),
-        counterfactual_future_observation=(
-            None if cf_futures_obs is None else np.stack(cf_futures_obs)
-        ),
     )
 
 

@@ -9,7 +9,7 @@ CLSM-Toy experiments.
 
 Visualization principles
 ------------------------
-- visualization functions consume artifacts and optional metadata produced by ``evaluation.py``;
+- visualization functions consume saved training and evaluation artifacts;
 - statistical analyses are not silently re-fitted inside plotting functions;
 - counterfactual pairs are used only as an evaluation oracle;
 - latent-space panels within a figure use a common fitted projection.
@@ -44,6 +44,48 @@ MetricDict = dict[str, MetricValue]
 
 
 # =============================================================================
+# Constants
+# =============================================================================
+
+DEFAULT_EPISODE_INDEX = 0
+DEFAULT_PROJECTION_COMPONENTS = 2
+
+DEFAULT_VISUALIZATION_SEED = 42
+DEFAULT_MAX_LATENT_POINTS = 5_000
+DEFAULT_MAX_COUNTERFACTUAL_PAIRS = 1_000
+
+DEFAULT_OBSERVATION_FEATURE_INDICES = (
+    0,
+    1,
+)
+
+DEFAULT_CONNECTOR_ALPHA = 0.18
+DEFAULT_CONNECTOR_LINEWIDTH = 0.6
+
+DEFAULT_COUNTERFACTUAL_CONNECTOR_ALPHA = 0.07
+DEFAULT_COUNTERFACTUAL_CONNECTOR_LINEWIDTH = 0.35
+
+DEFAULT_HISTORY_METRIC = "selection_total"
+DEFAULT_SPLIT = "test"
+
+DEFAULT_TRAINING_COMPONENTS = (
+    "observation",
+    "predictive",
+    "temporal",
+    "structural",
+    "minimality",
+    "invariance",
+)
+
+GRID_ALPHA = 0.22
+
+CCA_HIGH_REFERENCE = 0.9
+CCA_MODERATE_REFERENCE = 0.5
+
+HEATMAP_TEXT_CONTRAST_THRESHOLD = 0.55
+
+
+# =============================================================================
 # Visualization data structure
 # =============================================================================
 
@@ -58,52 +100,6 @@ class LatentProjection:
 # =============================================================================
 # Artifact loading
 # =============================================================================
-
-def load_encoded(
-    path: str | Path,
-) -> dict[str, np.ndarray]:
-    """Load an encoded dataset saved by evaluation.py."""
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    with np.load(
-        path,
-        allow_pickle=False,
-    ) as archive:
-        return {
-            name: archive[name]
-            for name in archive.files
-        }
-
-def load_metrics(
-    path: str | Path,
-) -> dict[str, MetricDict]:
-    """Load split-wise evaluation metrics."""
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    with path.open(
-        "r",
-        encoding="utf-8",
-    ) as stream:
-        return json.load(stream)
-
-
-def load_history(
-    path: str | Path,
-) -> pd.DataFrame:
-    """Load training history produced by train.py."""
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    return pd.read_csv(path)
-
 
 def load_cca_analysis(
     path: str | Path,
@@ -129,6 +125,53 @@ def load_cca_analysis(
     )
 
     return arrays
+
+
+def load_encoded(
+    path: str | Path,
+) -> dict[str, np.ndarray]:
+    """Load an encoded dataset saved by evaluation.py."""
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with np.load(
+        path,
+        allow_pickle=False,
+    ) as archive:
+        return {
+            name: archive[name]
+            for name in archive.files
+        }
+
+
+def load_history(
+    path: str | Path,
+) -> pd.DataFrame:
+    """Load a training-history CSV produced by the CLSM training pipeline."""
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    return pd.read_csv(path)
+
+
+def load_metrics(
+    path: str | Path,
+) -> dict[str, MetricDict]:
+    """Load split-wise evaluation metrics."""
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as stream:
+        return json.load(stream)
 
 
 # =============================================================================
@@ -158,6 +201,20 @@ def save_figure(
 # Internal utilities
 # =============================================================================
 
+def _metric_value(
+    metrics: Mapping[str, object],
+    metric_name: str,
+) -> float:
+    value = metrics.get(
+        metric_name
+    )
+
+    if value is None:
+        return float("nan")
+
+    return float(value)
+
+
 def _require_keys(
     mapping: Mapping[str, object],
     keys: Sequence[str],
@@ -176,23 +233,25 @@ def _require_keys(
         )
 
 
-def _sample_indices(
-    n_points: int,
-    max_points: int,
-    seed: int,
-) -> np.ndarray:
-    if n_points <= max_points:
-        return np.arange(n_points)
+def _resolve_dimension_labels(
+    names: Sequence[str],
+    labels: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Validate display labels or use dimension names as labels."""
+    if labels is None:
+        return tuple(names)
 
-    generator = np.random.default_rng(
-        seed
+    resolved = tuple(
+        str(label)
+        for label in labels
     )
 
-    return generator.choice(
-        n_points,
-        size=max_points,
-        replace=False,
-    )
+    if len(resolved) != len(names):
+        raise ValueError(
+            "Dimension labels and names must have the same length."
+        )
+
+    return resolved
 
 
 def _resolve_dimension_names(
@@ -232,25 +291,23 @@ def _resolve_dimension_names(
     return resolved
 
 
-def _resolve_dimension_labels(
-    names: Sequence[str],
-    labels: Sequence[str] | None = None,
-) -> tuple[str, ...]:
-    """Validate display labels or use dimension names as labels."""
-    if labels is None:
-        return tuple(names)
+def _sample_indices(
+    n_points: int,
+    max_points: int,
+    seed: int,
+) -> np.ndarray:
+    if n_points <= max_points:
+        return np.arange(n_points)
 
-    resolved = tuple(
-        str(label)
-        for label in labels
+    generator = np.random.default_rng(
+        seed
     )
 
-    if len(resolved) != len(names):
-        raise ValueError(
-            "Dimension labels and names must have the same length."
-        )
-
-    return resolved
+    return generator.choice(
+        n_points,
+        size=max_points,
+        replace=False,
+    )
 
 
 def _infer_state_names(
@@ -278,20 +335,6 @@ def _infer_state_names(
     )
 
 
-def _metric_value(
-    metrics: Mapping[str, object],
-    metric_name: str,
-) -> float:
-    value = metrics.get(
-        metric_name
-    )
-
-    if value is None:
-        return float("nan")
-
-    return float(value)
-
-
 # =============================================================================
 # Latent-space projection
 # =============================================================================
@@ -299,7 +342,7 @@ def _metric_value(
 def fit_latent_projection(
     reference_latent: np.ndarray,
     *,
-    n_components: int = 2,
+    n_components: int = DEFAULT_PROJECTION_COMPONENTS,
 ) -> LatentProjection:
     """Fit a standardized PCA projection on a reference latent dataset."""
     if reference_latent.ndim != 3:
@@ -362,130 +405,220 @@ def transform_latent(
 # Primitive visualization functions
 # =============================================================================
 
-def plot_observation_views(
-    observation: np.ndarray,
-    counterfactual_observation: np.ndarray,
+def plot_cca_correlations(
+    canonical_correlations: np.ndarray,
     *,
-    episode_index: int = 0,
-    feature_indices: tuple[int, int] = (0, 1),
-    feature_labels: Sequence[str] | None = None,
-    connector_alpha: float = 0.18,
-    connector_linewidth: float = 0.6,
     ax: Axes | None = None,
 ) -> Axes:
-    """Plot two nuisance-conditioned views of the same trajectory."""
-    if observation.ndim != 3:
-        raise ValueError(
-            "observation must have shape (N, T, observation_dim)."
-        )
-
-    if counterfactual_observation.shape != observation.shape:
-        raise ValueError(
-            "counterfactual_observation must match observation."
-        )
-
-    if not 0 <= episode_index < observation.shape[0]:
-        raise IndexError(
-            "episode_index is out of range."
-        )
-
-    first, second = feature_indices
-    observation_dimension = observation.shape[-1]
-
-    if (
-        first < 0
-        or second < 0
-        or first >= observation_dimension
-        or second >= observation_dimension
-    ):
-        raise IndexError(
-            "feature_indices exceed observation dimension."
-        )
-
-    default_feature_names = _resolve_dimension_names(
-        observation_dimension,
-        prefix="observation",
-    )
-
-    if feature_labels is None:
-        first_label = default_feature_names[first]
-        second_label = default_feature_names[second]
-    else:
-        resolved_labels = tuple(
-            str(label)
-            for label in feature_labels
-        )
-
-        if len(resolved_labels) == observation_dimension:
-            first_label = resolved_labels[first]
-            second_label = resolved_labels[second]
-        elif len(resolved_labels) == len(feature_indices):
-            first_label, second_label = resolved_labels
-        else:
-            raise ValueError(
-                "feature_labels must contain either one label per "
-                "observation dimension or one label per displayed feature."
-            )
+    """Plot canonical correlations between latent and physical state spaces."""
+    correlations = np.asarray(
+        canonical_correlations,
+        dtype=float,
+    ).reshape(-1)
 
     if ax is None:
         _, ax = plt.subplots(
-            figsize=(5, 5)
+            figsize=(6.4, 4.4)
         )
 
-    view_a = observation[
-        episode_index
-    ]
-    view_b = counterfactual_observation[
-        episode_index
-    ]
+    x_positions = np.arange(
+        1,
+        correlations.size + 1,
+    )
+
+    bars = ax.bar(
+        x_positions,
+        correlations,
+        edgecolor="black",
+        linewidth=0.8,
+    )
+
+    ax.axhline(
+        CCA_HIGH_REFERENCE,
+        linestyle="--",
+        linewidth=1.1,
+        alpha=0.65,
+    )
+
+    ax.axhline(
+        CCA_MODERATE_REFERENCE,
+        linestyle=":",
+        linewidth=1.1,
+        alpha=0.65,
+    )
+
+    ax.set_xticks(
+        x_positions,
+        labels=[
+            rf"$\rho_{index}$"
+            for index in x_positions
+        ],
+    )
+
+    ax.set_ylim(
+        0.0,
+        1.05,
+    )
+    ax.set_xlabel(
+        "Canonical component"
+    )
+    ax.set_ylabel(
+        "Canonical correlation"
+    )
+    ax.set_title(
+        "Linear alignment between latent and physical state spaces"
+    )
+    ax.grid(
+        axis="y",
+        alpha=GRID_ALPHA,
+    )
+
+    for bar, value in zip(
+        bars,
+        correlations,
+        strict=True,
+    ):
+        ax.text(
+            bar.get_x()
+            + bar.get_width() / 2.0,
+            value + 0.025,
+            f"{value:.2f}",
+            horizontalalignment="center",
+            verticalalignment="bottom",
+        )
+
+    return ax
+
+
+def plot_counterfactual_alignment(
+    latent: np.ndarray,
+    counterfactual_latent: np.ndarray,
+    *,
+    projection: LatentProjection | None = None,
+    episode_index: int | None = None,
+    max_pairs: int = DEFAULT_MAX_COUNTERFACTUAL_PAIRS,
+    seed: int = DEFAULT_VISUALIZATION_SEED,
+    connector_alpha: float = DEFAULT_COUNTERFACTUAL_CONNECTOR_ALPHA,
+    connector_linewidth: float = DEFAULT_COUNTERFACTUAL_CONNECTOR_LINEWIDTH,
+    ax: Axes | None = None,
+) -> Axes:
+    """Plot paired counterfactual representations in a shared PCA space."""
+    if latent.shape != counterfactual_latent.shape:
+        raise ValueError(
+            "latent and counterfactual_latent must have identical shapes."
+        )
+
+    if projection is None:
+        projection = fit_latent_projection(
+            np.concatenate(
+                [
+                    latent,
+                    counterfactual_latent,
+                ],
+                axis=0,
+            )
+        )
+
+    projected_a = transform_latent(
+        latent,
+        projection,
+    )
+
+    projected_b = transform_latent(
+        counterfactual_latent,
+        projection,
+    )
+
+    if episode_index is not None:
+        if not 0 <= episode_index < latent.shape[0]:
+            raise IndexError(
+                "episode_index is out of range."
+            )
+
+        points_a = projected_a[
+            episode_index
+        ]
+        points_b = projected_b[
+            episode_index
+        ]
+    else:
+        flat_a = projected_a.reshape(
+            -1,
+            2,
+        )
+
+        flat_b = projected_b.reshape(
+            -1,
+            2,
+        )
+
+        indices = _sample_indices(
+            flat_a.shape[0],
+            max_pairs,
+            seed,
+        )
+
+        points_a = flat_a[
+            indices
+        ]
+        points_b = flat_b[
+            indices
+        ]
+
+    if ax is None:
+        _, ax = plt.subplots(
+            figsize=(6, 5)
+        )
 
     for point_a, point_b in zip(
-        view_a,
-        view_b,
+        points_a,
+        points_b,
         strict=True,
     ):
         ax.plot(
             [
-                point_a[first],
-                point_b[first],
+                point_a[0],
+                point_b[0],
             ],
             [
-                point_a[second],
-                point_b[second],
+                point_a[1],
+                point_b[1],
             ],
             linewidth=connector_linewidth,
             alpha=connector_alpha,
             zorder=0,
         )
 
-    ax.plot(
-        view_a[:, first],
-        view_a[:, second],
-        marker="o",
-        markersize=3,
-        linewidth=1.5,
+    ax.scatter(
+        points_a[:, 0],
+        points_a[:, 1],
+        s=7,
+        alpha=0.62,
         label="View A",
         zorder=2,
     )
 
-    ax.plot(
-        view_b[:, first],
-        view_b[:, second],
-        marker="o",
-        markersize=3,
-        linewidth=1.5,
+    ax.scatter(
+        points_b[:, 0],
+        points_b[:, 1],
+        s=7,
+        alpha=0.62,
         label="Counterfactual view B",
         zorder=2,
     )
 
+    explained = (
+        projection.projector.explained_variance_ratio_
+    )
+
     ax.set_xlabel(
-        first_label
+        f"PC1 ({100.0 * explained[0]:.1f}%)"
     )
     ax.set_ylabel(
-        second_label
+        f"PC2 ({100.0 * explained[1]:.1f}%)"
     )
     ax.set_title(
-        "Two measurements of the same physical trajectory"
+        "Counterfactual views align in latent space"
     )
     ax.legend()
 
@@ -501,8 +634,8 @@ def plot_latent_space(
     state_names: Sequence[str] | None = None,
     state_labels: Sequence[str] | None = None,
     color_by: str | int = 0,
-    max_points: int = 5_000,
-    seed: int = 42,
+    max_points: int = DEFAULT_MAX_LATENT_POINTS,
+    seed: int = DEFAULT_VISUALIZATION_SEED,
     ax: Axes | None = None,
 ) -> Axes:
     """Plot a shared PCA projection colored by a state dimension or nuisance."""
@@ -648,7 +781,7 @@ def plot_latent_space(
 def plot_latent_trajectory(
     latent: np.ndarray,
     *,
-    episode_index: int = 0,
+    episode_index: int = DEFAULT_EPISODE_INDEX,
     projection: LatentProjection | None = None,
     ax: Axes | None = None,
 ) -> Axes:
@@ -750,135 +883,130 @@ def plot_latent_trajectory(
     return ax
 
 
-def plot_counterfactual_alignment(
-    latent: np.ndarray,
-    counterfactual_latent: np.ndarray,
+def plot_observation_views(
+    observation: np.ndarray,
+    counterfactual_observation: np.ndarray,
     *,
-    projection: LatentProjection | None = None,
-    episode_index: int | None = None,
-    max_pairs: int = 1_000,
-    seed: int = 42,
-    connector_alpha: float = 0.07,
-    connector_linewidth: float = 0.35,
+    episode_index: int = DEFAULT_EPISODE_INDEX,
+    feature_indices: tuple[int, int] = DEFAULT_OBSERVATION_FEATURE_INDICES,
+    feature_labels: Sequence[str] | None = None,
+    connector_alpha: float = DEFAULT_CONNECTOR_ALPHA,
+    connector_linewidth: float = DEFAULT_CONNECTOR_LINEWIDTH,
     ax: Axes | None = None,
 ) -> Axes:
-    """Plot paired counterfactual representations in a shared PCA space."""
-    if latent.shape != counterfactual_latent.shape:
+    """Plot two nuisance-conditioned views of the same trajectory."""
+    if observation.ndim != 3:
         raise ValueError(
-            "latent and counterfactual_latent must have identical shapes."
+            "observation must have shape (N, T, observation_dim)."
         )
 
-    if projection is None:
-        projection = fit_latent_projection(
-            np.concatenate(
-                [
-                    latent,
-                    counterfactual_latent,
-                ],
-                axis=0,
-            )
+    if counterfactual_observation.shape != observation.shape:
+        raise ValueError(
+            "counterfactual_observation must match observation."
         )
 
-    projected_a = transform_latent(
-        latent,
-        projection,
+    if not 0 <= episode_index < observation.shape[0]:
+        raise IndexError(
+            "episode_index is out of range."
+        )
+
+    first, second = feature_indices
+    observation_dimension = observation.shape[-1]
+
+    if (
+        first < 0
+        or second < 0
+        or first >= observation_dimension
+        or second >= observation_dimension
+    ):
+        raise IndexError(
+            "feature_indices exceed observation dimension."
+        )
+
+    default_feature_names = _resolve_dimension_names(
+        observation_dimension,
+        prefix="observation",
     )
 
-    projected_b = transform_latent(
-        counterfactual_latent,
-        projection,
-    )
-
-    if episode_index is not None:
-        if not 0 <= episode_index < latent.shape[0]:
-            raise IndexError(
-                "episode_index is out of range."
-            )
-
-        points_a = projected_a[
-            episode_index
-        ]
-        points_b = projected_b[
-            episode_index
-        ]
+    if feature_labels is None:
+        first_label = default_feature_names[first]
+        second_label = default_feature_names[second]
     else:
-        flat_a = projected_a.reshape(
-            -1,
-            2,
+        resolved_labels = tuple(
+            str(label)
+            for label in feature_labels
         )
 
-        flat_b = projected_b.reshape(
-            -1,
-            2,
-        )
-
-        indices = _sample_indices(
-            flat_a.shape[0],
-            max_pairs,
-            seed,
-        )
-
-        points_a = flat_a[
-            indices
-        ]
-        points_b = flat_b[
-            indices
-        ]
+        if len(resolved_labels) == observation_dimension:
+            first_label = resolved_labels[first]
+            second_label = resolved_labels[second]
+        elif len(resolved_labels) == len(feature_indices):
+            first_label, second_label = resolved_labels
+        else:
+            raise ValueError(
+                "feature_labels must contain either one label per "
+                "observation dimension or one label per displayed feature."
+            )
 
     if ax is None:
         _, ax = plt.subplots(
-            figsize=(6, 5)
+            figsize=(5, 5)
         )
 
+    view_a = observation[
+        episode_index
+    ]
+    view_b = counterfactual_observation[
+        episode_index
+    ]
+
     for point_a, point_b in zip(
-        points_a,
-        points_b,
+        view_a,
+        view_b,
         strict=True,
     ):
         ax.plot(
             [
-                point_a[0],
-                point_b[0],
+                point_a[first],
+                point_b[first],
             ],
             [
-                point_a[1],
-                point_b[1],
+                point_a[second],
+                point_b[second],
             ],
             linewidth=connector_linewidth,
             alpha=connector_alpha,
             zorder=0,
         )
 
-    ax.scatter(
-        points_a[:, 0],
-        points_a[:, 1],
-        s=7,
-        alpha=0.62,
+    ax.plot(
+        view_a[:, first],
+        view_a[:, second],
+        marker="o",
+        markersize=3,
+        linewidth=1.5,
         label="View A",
         zorder=2,
     )
 
-    ax.scatter(
-        points_b[:, 0],
-        points_b[:, 1],
-        s=7,
-        alpha=0.62,
+    ax.plot(
+        view_b[:, first],
+        view_b[:, second],
+        marker="o",
+        markersize=3,
+        linewidth=1.5,
         label="Counterfactual view B",
         zorder=2,
     )
 
-    explained = (
-        projection.projector.explained_variance_ratio_
-    )
-
     ax.set_xlabel(
-        f"PC1 ({100.0 * explained[0]:.1f}%)"
+        first_label
     )
     ax.set_ylabel(
-        f"PC2 ({100.0 * explained[1]:.1f}%)"
+        second_label
     )
     ax.set_title(
-        "Counterfactual views align in latent space"
+        "Two measurements of the same physical trajectory"
     )
     ax.legend()
 
@@ -968,149 +1096,7 @@ def plot_state_probe_comparison(
     )
     ax.grid(
         axis="y",
-        alpha=0.22,
-    )
-    ax.legend()
-
-    return ax
-
-
-def plot_cca_correlations(
-    canonical_correlations: np.ndarray,
-    *,
-    ax: Axes | None = None,
-) -> Axes:
-    """Plot canonical correlations between latent and physical state spaces."""
-    correlations = np.asarray(
-        canonical_correlations,
-        dtype=float,
-    ).reshape(-1)
-
-    if ax is None:
-        _, ax = plt.subplots(
-            figsize=(6.4, 4.4)
-        )
-
-    x_positions = np.arange(
-        1,
-        correlations.size + 1,
-    )
-
-    bars = ax.bar(
-        x_positions,
-        correlations,
-        edgecolor="black",
-        linewidth=0.8,
-    )
-
-    ax.axhline(
-        0.9,
-        linestyle="--",
-        linewidth=1.1,
-        alpha=0.65,
-    )
-
-    ax.axhline(
-        0.5,
-        linestyle=":",
-        linewidth=1.1,
-        alpha=0.65,
-    )
-
-    ax.set_xticks(
-        x_positions,
-        labels=[
-            rf"$\rho_{index}$"
-            for index in x_positions
-        ],
-    )
-
-    ax.set_ylim(
-        0.0,
-        1.05,
-    )
-    ax.set_xlabel(
-        "Canonical component"
-    )
-    ax.set_ylabel(
-        "Canonical correlation"
-    )
-    ax.set_title(
-        "Linear alignment between latent and physical state spaces"
-    )
-    ax.grid(
-        axis="y",
-        alpha=0.22,
-    )
-
-    for bar, value in zip(
-        bars,
-        correlations,
-        strict=True,
-    ):
-        ax.text(
-            bar.get_x()
-            + bar.get_width() / 2.0,
-            value + 0.025,
-            f"{value:.2f}",
-            horizontalalignment="center",
-            verticalalignment="bottom",
-        )
-
-    return ax
-
-
-def plot_training_history(
-    history: pd.DataFrame,
-    *,
-    metric: str = "selection_total",
-    ax: Axes | None = None,
-) -> Axes:
-    """Plot training and validation curves for one metric."""
-    train_column = f"train_{metric}"
-    validation_column = f"validation_{metric}"
-
-    _require_keys(
-        history,
-        (
-            "epoch",
-            train_column,
-            validation_column,
-        ),
-        context="history",
-    )
-
-    if ax is None:
-        _, ax = plt.subplots(
-            figsize=(6, 4)
-        )
-
-    ax.plot(
-        history["epoch"],
-        history[train_column],
-        label="Train",
-    )
-
-    ax.plot(
-        history["epoch"],
-        history[validation_column],
-        label="Validation",
-    )
-
-    ax.set_xlabel(
-        "Epoch"
-    )
-    ax.set_ylabel(
-        metric.replace(
-            "_",
-            " ",
-        ).title()
-    )
-    ax.set_title(
-        "Training history"
-    )
-    ax.grid(
-        alpha=0.22,
+        alpha=GRID_ALPHA,
     )
     ax.legend()
 
@@ -1120,14 +1106,7 @@ def plot_training_history(
 def plot_training_components(
     history: pd.DataFrame,
     *,
-    components: Sequence[str] = (
-        "observation",
-        "predictive",
-        "temporal",
-        "structural",
-        "minimality",
-        "invariance",
-    ),
+    components: Sequence[str] = DEFAULT_TRAINING_COMPONENTS,
 ) -> Figure:
     """Plot separate raw training and validation curves for loss components."""
     figure, axes = plt.subplots(
@@ -1182,7 +1161,7 @@ def plot_training_components(
             "Epoch"
         )
         axis.grid(
-            alpha=0.22,
+            alpha=GRID_ALPHA,
         )
 
     visible_axes = [
@@ -1199,95 +1178,61 @@ def plot_training_components(
     return figure
 
 
-def plot_adversarial_dynamics(
+def plot_training_history(
     history: pd.DataFrame,
     *,
-    chance_level: float | None = None,
-) -> Figure:
-    """Plot adversarial cross-entropy and classification accuracy."""
-    required = (
-        "epoch",
-        "train_raw_invariance",
-        "validation_raw_invariance",
-        "train_nuisance_adversarial_accuracy",
-        "validation_nuisance_adversarial_accuracy",
-    )
+    metric: str = DEFAULT_HISTORY_METRIC,
+    ax: Axes | None = None,
+) -> Axes:
+    """Plot training and validation curves for one metric."""
+    train_column = f"train_{metric}"
+    validation_column = f"validation_{metric}"
 
     _require_keys(
         history,
-        required,
-        context="adversarial history",
+        (
+            "epoch",
+            train_column,
+            validation_column,
+        ),
+        context="history",
     )
 
-    figure, axes = plt.subplots(
-        1,
-        2,
-        figsize=(11, 4.3),
-    )
-
-    axes[0].plot(
-        history["epoch"],
-        history["train_raw_invariance"],
-        label="Train",
-    )
-
-    axes[0].plot(
-        history["epoch"],
-        history["validation_raw_invariance"],
-        label="Validation",
-    )
-
-    axes[0].set_xlabel(
-        "Epoch"
-    )
-    axes[0].set_ylabel(
-        "Adversarial cross-entropy"
-    )
-    axes[0].set_title(
-        "Nuisance adversary loss"
-    )
-    axes[0].grid(
-        alpha=0.22,
-    )
-    axes[0].legend()
-
-    axes[1].plot(
-        history["epoch"],
-        history["train_nuisance_adversarial_accuracy"],
-        label="Train",
-    )
-
-    axes[1].plot(
-        history["epoch"],
-        history["validation_nuisance_adversarial_accuracy"],
-        label="Validation",
-    )
-
-    if chance_level is not None:
-        axes[1].axhline(
-            chance_level,
-            linestyle="--",
-            linewidth=1.2,
-            label="Chance",
+    if ax is None:
+        _, ax = plt.subplots(
+            figsize=(6, 4)
         )
 
-    axes[1].set_xlabel(
+    ax.plot(
+        history["epoch"],
+        history[train_column],
+        label="Train",
+    )
+
+    ax.plot(
+        history["epoch"],
+        history[validation_column],
+        label="Validation",
+    )
+
+    ax.set_xlabel(
         "Epoch"
     )
-    axes[1].set_ylabel(
-        "Adversarial accuracy"
+    ax.set_ylabel(
+        metric.replace(
+            "_",
+            " ",
+        ).title()
     )
-    axes[1].set_title(
-        "Nuisance predictability during training"
+    ax.set_title(
+        "Training history"
     )
-    axes[1].grid(
-        alpha=0.22,
+    ax.grid(
+        alpha=GRID_ALPHA,
     )
-    axes[1].legend()
+    ax.legend()
 
-    figure.tight_layout()
-
-    return figure
+    return ax
 
 
 # =============================================================================
@@ -1298,7 +1243,7 @@ def create_environment_representation_figure(
     encoded: Mapping[str, np.ndarray],
     *,
     metadata: Mapping[str, object] | None = None,
-    episode_index: int = 0,
+    episode_index: int = DEFAULT_EPISODE_INDEX,
 ) -> Figure:
     """Create a four-panel environment and representation figure."""
     required = (
@@ -1374,7 +1319,7 @@ def create_environment_representation_figure(
         encoded["latent"],
         encoded["counterfactual_latent"],
         projection=projection,
-        max_pairs=1_000,
+        max_pairs=DEFAULT_MAX_COUNTERFACTUAL_PAIRS,
         ax=axes[1, 0],
     )
 
@@ -1398,7 +1343,7 @@ def create_environment_representation_figure(
         "D. Temporal organization of one latent trajectory"
     )
 
-    # synchronizing the limits
+    # Synchronize latent-space limits.
     axis_b = axes[0, 1]
     axis_c = axes[1, 0]
     axis_d = axes[1, 1]
@@ -1607,7 +1552,7 @@ def create_state_analysis_figure(
                     color=(
                         "white"
                         if abs(value)
-                        > 0.55 * maximum
+                        > HEATMAP_TEXT_CONTRAST_THRESHOLD * maximum
                         else "black"
                     ),
                     fontsize=8,
@@ -1671,7 +1616,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     environment.add_argument(
         "--episode-index",
         type=int,
-        default=0,
+        default=DEFAULT_EPISODE_INDEX,
     )
 
     state = subparsers.add_parser(
@@ -1692,7 +1637,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     state.add_argument(
         "--split",
-        default="test",
+        default=DEFAULT_SPLIT,
     )
     state.add_argument(
         "--output",
@@ -1709,7 +1654,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     history.add_argument(
         "--metric",
-        default="selection_total",
+        default=DEFAULT_HISTORY_METRIC,
     )
     history.add_argument(
         "--output",
@@ -1725,24 +1670,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
     )
     components.add_argument(
-        "--output",
-        required=True,
-    )
-
-    adversarial = subparsers.add_parser(
-        "adversarial",
-        help="Plot adversarial training dynamics.",
-    )
-    adversarial.add_argument(
-        "--history",
-        required=True,
-    )
-    adversarial.add_argument(
-        "--chance-level",
-        type=float,
-        default=None,
-    )
-    adversarial.add_argument(
         "--output",
         required=True,
     )
@@ -1861,26 +1788,6 @@ def main() -> None:
 
         figure = plot_training_components(
             history
-        )
-
-        save_figure(
-            figure,
-            args.output,
-        )
-        plt.close(figure)
-
-    # -------------------------------------------------------------------------
-    # Adversarial dynamics
-    # -------------------------------------------------------------------------
-
-    elif args.command == "adversarial":
-        history = load_history(
-            args.history
-        )
-
-        figure = plot_adversarial_dynamics(
-            history,
-            chance_level=args.chance_level,
         )
 
         save_figure(

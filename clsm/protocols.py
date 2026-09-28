@@ -1,6 +1,9 @@
 """
 Typing protocols for the generic CLSM framework.
 
+Author: Gwenolé Quellec
+Year: 2026
+
 These protocols specify the minimal interfaces expected from environments,
 nuisances, and other interchangeable components. Concrete implementations
 satisfy these interfaces through structural typing and do not need to inherit
@@ -16,6 +19,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 
 from .models import CLSMModelConfig
+
 if TYPE_CHECKING:
     from .datasets import CounterfactualEpisode, Episode
 
@@ -25,10 +29,6 @@ if TYPE_CHECKING:
 # =============================================================================
 
 FloatArray = NDArray[np.float64]
-NuisanceT = TypeVar(
-    "NuisanceT",
-    covariant=True,
-)
 
 
 # =============================================================================
@@ -46,8 +46,22 @@ class NuisanceProtocol(Protocol):
     def is_ood(self) -> bool:
         ...
 
-    def as_vector(self) -> FloatArray:
+    def continuous_vector(self) -> FloatArray:
         ...
+
+    def as_vector(
+        self,
+        *,
+        include_id: bool = True,
+    ) -> FloatArray:
+        ...
+
+
+NuisanceT = TypeVar(
+    "NuisanceT",
+    bound=NuisanceProtocol,
+    covariant=True,
+)
 
 
 # =============================================================================
@@ -106,9 +120,10 @@ class CLSMModelProtocol(Protocol):
     """
     Interface of a generic CLSM model.
 
-    Training, evaluation, and visualization interact with models through
-    this protocol, independently of the underlying architecture.
+    Training, evaluation, and visualization can interact with models through
+    this protocol independently of the underlying architecture.
     """
+
     config: CLSMModelConfig
 
     def encode(
@@ -135,14 +150,5 @@ class CLSMModelProtocol(Protocol):
         self,
         initial_latent: Tensor,
         horizon: int,
-    ) -> Tensor:
-        ...
-
-    def predict_nuisance(
-        self,
-        latent: Tensor,
-        *,
-        adversarial: bool = True,
-        coefficient: float | None = None,
     ) -> Tensor:
         ...

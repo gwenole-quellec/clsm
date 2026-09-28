@@ -1,20 +1,25 @@
 """
 Train CLSM on the toy dataset.
 
+Author: Gwenolé Quellec
+Year: 2026
+
 Examples
 --------
-Train the ``full`` CLSM objective:
+Train configuration ``P3``:
 
     python -m toy.train \
         --data-dir data/ \
-        --preset full \
+        --configurations-file toy/configurations.json \
+        --preset P3 \
         --epochs 100
 
 Train five models with different random seeds:
 
     python -m toy.train \
         --data-dir data/ \
-        --preset full \
+        --configurations-file toy/configurations.json \
+        --preset P3 \
         --seeds 0 1 2 3 4
 """
 
@@ -65,12 +70,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=(64, 64),
     )
-    parser.add_argument(
-        "--nuisance-hidden-dims",
-        type=int,
-        nargs="+",
-        default=(32,),
-    )
 
     return parser
 
@@ -83,11 +82,6 @@ def build_model_config(
     args: argparse.Namespace,
 ) -> CLSMModelConfig:
     """Build the model configuration for the toy experiment."""
-    if args.gradient_reversal_coefficient < 0.0:
-        raise ValueError(
-            "gradient_reversal_coefficient must be non-negative."
-        )
-
     return CLSMModelConfig(
         observation_dim=UNRESOLVED_OBSERVATION_DIM,
         latent_dim=args.latent_dim,
@@ -99,13 +93,6 @@ def build_model_config(
         ),
         transition_hidden_dims=tuple(
             args.transition_hidden_dims
-        ),
-        nuisance_hidden_dims=tuple(
-            args.nuisance_hidden_dims
-        ),
-        n_nuisances=None,
-        gradient_reversal_coefficient=(
-            args.gradient_reversal_coefficient
         ),
     )
 

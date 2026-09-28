@@ -10,7 +10,6 @@ CLSM experiments:
 - an observation encoder;
 - an observation decoder;
 - a latent transition model;
-- an adversarial nuisance predictor with gradient reversal;
 - a composite CLSMModel wrapper.
 
 The models are intentionally based on small multilayer perceptrons. The goal is
@@ -25,56 +24,6 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-
-
-# =============================================================================
-# Gradient reversal utilities
-# =============================================================================
-
-class _GradientReversalFunction(torch.autograd.Function):
-    """Identity in the forward pass and sign reversal in the backward pass."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        inputs: Tensor,
-        coefficient: float,
-    ) -> Tensor:
-        ctx.coefficient = float(coefficient)
-        return inputs.view_as(inputs)
-
-    @staticmethod
-    def backward(
-        ctx,
-        gradients: Tensor,
-    ) -> tuple[Tensor, None]:
-        return (
-            -ctx.coefficient * gradients,
-            None,
-        )
-
-
-def gradient_reverse(
-    inputs: Tensor,
-    coefficient: float = 1.0,
-) -> Tensor:
-    """
-    Reverse gradients flowing through ``inputs``.
-
-    The forward pass is the identity. During backpropagation, gradients are
-    multiplied by ``-coefficient``. This allows a nuisance predictor to be
-    trained normally while encouraging the encoder to remove nuisance-related
-    information.
-    """
-    if coefficient < 0.0:
-        raise ValueError(
-            "gradient-reversal coefficient must be non-negative."
-        )
-
-    return _GradientReversalFunction.apply(
-        inputs,
-        float(coefficient),
-    )
 
 
 # =============================================================================
@@ -384,45 +333,6 @@ class LatentTransitionModel(nn.Module):
         return torch.stack(states, dim=-2)
 
 
-class NuisanceClassifier(nn.Module):
-    """
-    Predict nuisance identity from latent representations.
-
-    Gradient reversal is optionally applied by :class:`CLSMModel` before the
-    latent representations are passed to this classifier.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        n_nuisances: int,
-        hidden_dims: Sequence[int] = (32,),
-    ) -> None:
-        super().__init__()
-
-        self.latent_dim = int(latent_dim)
-        self.n_nuisances = int(n_nuisances)
-
-        self.network = make_mlp(
-            latent_dim,
-            n_nuisances,
-            hidden_dims,
-        )
-
-    def forward(self, latent: Tensor) -> Tensor:
-        if latent.shape[-1] != self.latent_dim:
-            raise ValueError(
-                f"Expected latent feature dimension "
-                f"{self.latent_dim}, got {latent.shape[-1]}."
-            )
-
-        original_shape = latent.shape[:-1]
-        flat = latent.reshape(-1, self.latent_dim)
-        logits = self.network(flat)
-
-        return logits.reshape(*original_shape, self.n_nuisances)
-
-
 # =============================================================================
 # Model configuration
 # =============================================================================
@@ -433,17 +343,14 @@ class CLSMModelConfig:
 
     observation_dim: int
     latent_dim: int
-    n_nuisances: int | None
 
     encoder_hidden_dims: tuple[int, ...] = (64, 64)
     decoder_hidden_dims: tuple[int, ...] = (64, 64)
     transition_hidden_dims: tuple[int, ...] = (64, 64)
-    nuisance_hidden_dims: tuple[int, ...] = (32,)
 
     variational: bool = False
     residual_transition: bool = True
     dropout: float = 0.0
-    gradient_reversal_coefficient: float = 1.0
 
 
 # =============================================================================
@@ -462,20 +369,12 @@ class CLSMModel(nn.Module):
         Latent-to-observation mapping.
     transition:
         One-step latent dynamics.
-    nuisance_classifier:
-        Optional latent-to-nuisance adversary trained through gradient
-        reversal.
     """
 
     def __init__(self, config: CLSMModelConfig) -> None:
         super().__init__()
 
         self.config = config
-
-        if config.gradient_reversal_coefficient < 0.0:
-            raise ValueError(
-                "gradient_reversal_coefficient must be non-negative."
-            )
 
         if config.variational:
             self.encoder = VariationalObservationEncoder(
@@ -505,23 +404,6 @@ class CLSMModel(nn.Module):
             dropout=config.dropout,
             residual=config.residual_transition,
         )
-
-        self.nuisance_classifier: NuisanceClassifier | None
-
-        if config.n_nuisances is None:
-            self.nuisance_classifier = None
-        else:
-            if config.n_nuisances < 2:
-                raise ValueError(
-                    "n_nuisances must be at least 2 when the nuisance "
-                    "adversary is enabled."
-                )
-
-            self.nuisance_classifier = NuisanceClassifier(
-                latent_dim=config.latent_dim,
-                n_nuisances=config.n_nuisances,
-                hidden_dims=config.nuisance_hidden_dims,
-            )
 
     def encode(
         self,
@@ -563,58 +445,12 @@ class CLSMModel(nn.Module):
         """Roll out latent dynamics for several steps."""
         return self.transition.rollout(initial_latent, horizon)
 
-    def predict_nuisance(
-        self,
-        latent: Tensor,
-        *,
-        adversarial: bool = True,
-        coefficient: float | None = None,
-    ) -> Tensor:
-        """
-        Predict nuisance identity from latent representations.
-
-        Parameters
-        ----------
-        latent:
-            Latent representations.
-        adversarial:
-            If true, apply gradient reversal before the nuisance classifier.
-        coefficient:
-            Optional gradient-reversal coefficient used when ``adversarial`` is
-            true. If omitted, the value from :class:`CLSMModelConfig` is used.
-        """
-        if self.nuisance_classifier is None:
-            raise RuntimeError(
-                "No categorical nuisance adversary is configured. "
-                "Set n_nuisances to an integer greater than or equal to 2."
-            )
-
-        if not adversarial:
-            return self.nuisance_classifier(latent)
-
-        reversal_coefficient = (
-            self.config.gradient_reversal_coefficient
-            if coefficient is None
-            else float(coefficient)
-        )
-
-        reversed_latent = gradient_reverse(
-            latent,
-            coefficient=reversal_coefficient,
-        )
-
-        return self.nuisance_classifier(
-            reversed_latent
-        )
-
     def forward(
         self,
         observation: Tensor,
         *,
-        counterfactual_observation: Tensor | None = None,
         sample: bool = True,
         rollout_horizon: int | None = None,
-        adversarial_coefficient: float | None = None,
     ) -> dict[str, Tensor]:
         """
         Run the full model on one observation sequence.
@@ -625,16 +461,11 @@ class CLSMModel(nn.Module):
             Tensor of shape ``(batch, time, observation_dim)`` for observation
             sequences or ``(..., observation_dim)`` for independent observations.
             Temporal predictions require an explicit batch and time dimension.
-        counterfactual_observation:
-            Optional second nuisance view of the same latent states.
         sample:
             Sample from the variational posterior when enabled.
         rollout_horizon:
             Optional number of future latent rollout steps from the final
             encoded state.
-        adversarial_coefficient:
-            Optional gradient-reversal coefficient for the nuisance
-            adversary. If omitted, the model configuration value is used.
 
         Returns
         -------
@@ -649,29 +480,10 @@ class CLSMModel(nn.Module):
             "reconstructed_observation": self.decode(latent),
         }
 
-        if self.nuisance_classifier is not None:
-            output["nuisance_logits"] = self.predict_nuisance(
-                latent,
-                adversarial=True,
-                coefficient=adversarial_coefficient,
-            )
-
         if latent.ndim >= 3 and latent.shape[-2] >= 2:
             output["predicted_next_latent"] = self.predict_next_latent(
                 latent[..., :-1, :]
             )
-
-        if counterfactual_observation is not None:
-            counterfactual_encoded = self.encode(
-                counterfactual_observation,
-                sample=sample,
-            )
-            output["counterfactual_latent"] = counterfactual_encoded["latent"]
-            output["counterfactual_mean"] = counterfactual_encoded["mean"]
-            if "log_variance" in counterfactual_encoded:
-                output["counterfactual_log_variance"] = (
-                    counterfactual_encoded["log_variance"]
-                )
 
         if rollout_horizon is not None:
             if rollout_horizon < 1:
@@ -701,10 +513,5 @@ class CLSMModel(nn.Module):
             "decoder": self.decoder.parameters(),
             "transition": self.transition.parameters(),
         }
-
-        if self.nuisance_classifier is not None:
-            groups["nuisance_adversary"] = (
-                self.nuisance_classifier.parameters()
-            )
 
         return groups

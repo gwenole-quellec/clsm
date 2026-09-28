@@ -1,6 +1,9 @@
 """
 Shared utility functions for the CLSM framework.
 
+Author: Gwenolé Quellec
+Year: 2026
+
 This module provides lightweight utilities reused across the core package
 and command-line scripts while remaining independent of any particular
 experiment or application.

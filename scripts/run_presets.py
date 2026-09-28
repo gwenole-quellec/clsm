@@ -11,24 +11,26 @@ the generic modules in the ``scripts`` package.
 
 The pipeline generates publication-ready figures, aggregates evaluation
 metrics across seeds, and saves all results in a standardized directory
-structure.
+structure.DEFAULT_CONFIGURATIONS_FILE = Path(
+    "toy/configurations.json"
+)
 
 Examples
 --------
-Run all presets defined by the toy training module:
+Run all presets defined in the configuration file:
 
     python -m scripts.run_presets \
         --train-module toy.train \
         --metadata toy/metadata.json \
         --data-dir data
 
-Run only the ``full`` preset:
+Run only the ``P5`` preset:
 
     python -m scripts.run_presets \
         --train-module toy.train \
         --metadata toy/metadata.json \
         --data-dir data \
-        --presets full
+        --presets P5
 
 Write runs and figures to custom directories:
 
@@ -46,38 +48,67 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
 from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
 
-from clsm.training import PRESET_WEIGHTS
+from clsm.training import load_configurations
 from clsm.utils import module_command, print_banner, print_separator
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+DEFAULT_SEEDS = (
+    0,
+    1,
+    2,
+    3,
+    4,
+)
+
+DEFAULT_DATA_DIR = "data"
+DEFAULT_RUNS_DIR = "runs"
+DEFAULT_FIGURES_DIR = "figures"
+DEFAULT_CONFIGURATIONS_FILE = Path(
+    "toy/configurations.json"
+)
+
+DEFAULT_ADVERSARY_STEPS = 15
+
+DEFAULT_PROBE_WORKERS = 1
+DEFAULT_PROBE_CACHE_DIR = ".probe-cache"
+DEFAULT_PROBE_PROFILE = "full"
+
+PROBE_PROFILES = (
+    "full",
+    "pareto",
+)
+
+DEFAULT_EPOCHS = 50
+DEFAULT_REFRESH_PRETRAIN_EPOCHS = 40
+DEFAULT_NUISANCE_PROBE_EPOCHS = 500
+
+DEFAULT_TRAIN_BATCH_SIZE = 128
+DEFAULT_EVALUATION_BATCH_SIZE = 256
+
+DEFAULT_ROLLOUT_HORIZONS = (
+    1,
+    5,
+    10,
+)
+
+DEFAULT_DEVICE = "auto"
+
+DEFAULT_VISUALIZATION_SEED = 0
+DEFAULT_EPISODE_INDEX = 0
 
 
 # =============================================================================
 # Pipeline helpers
 # =============================================================================
-
-def run_command(
-    command: list[str],
-    *,
-    title: str,
-) -> None:
-    """Print and execute one pipeline command."""
-    print_banner(title)
-    print(
-        subprocess.list2cmdline(
-            command
-        )
-    )
-
-    subprocess.run(
-        command,
-        check=True,
-    )
-
 
 def require_file(
     path: Path,
@@ -89,6 +120,32 @@ def require_file(
         )
 
 
+def run_command(
+    command: list[str],
+    *,
+    title: str,
+) -> None:
+    """Print and execute one pipeline command."""
+    print_banner(title)
+
+    print(
+        subprocess.list2cmdline(
+            command
+        )
+    )
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+        )
+
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(
+            error.returncode
+        ) from None
+
+
 # =============================================================================
 # Pipeline orchestration
 # =============================================================================
@@ -98,30 +155,39 @@ def run_preset_pipeline(
     train_module: str,
     metadata_path: str | Path,
     *,
-    seeds: Iterable[int] = (0, 1, 2, 3, 4),
-    data_dir: str | Path = "data",
-    runs_dir: str | Path = "runs",
-    figures_dir: str | Path = "figures",
-    epochs: int = 100,
-    train_batch_size: int = 128,
-    evaluation_batch_size: int = 256,
-    rollout_horizons: Iterable[int] = (1, 5, 10),
-    device: str = "cuda",
-    visualization_seed: int = 0,
-    episode_index: int = 0,
+    configurations_path: str | Path,
+    seeds: Iterable[int] = DEFAULT_SEEDS,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+    runs_dir: str | Path = DEFAULT_RUNS_DIR,
+    figures_dir: str | Path = DEFAULT_FIGURES_DIR,
+    adversary_steps: int = DEFAULT_ADVERSARY_STEPS,
+    probe_workers: int = DEFAULT_PROBE_WORKERS,
+    probe_cache_dir: str = DEFAULT_PROBE_CACHE_DIR,
+    strong_probe_epochs: int | None = None,
+    physical_probe_epochs: int | None = None,
+    epochs: int = DEFAULT_EPOCHS,
+    refresh_pretrain_epochs: int = DEFAULT_REFRESH_PRETRAIN_EPOCHS,
+    nuisance_probe_epochs: int = DEFAULT_NUISANCE_PROBE_EPOCHS,
+    train_batch_size: int = DEFAULT_TRAIN_BATCH_SIZE,
+    evaluation_batch_size: int = DEFAULT_EVALUATION_BATCH_SIZE,
+    rollout_horizons: Iterable[int] = DEFAULT_ROLLOUT_HORIZONS,
+    device: str = DEFAULT_DEVICE,
+    visualization_seed: int = DEFAULT_VISUALIZATION_SEED,
+    episode_index: int = DEFAULT_EPISODE_INDEX,
     adversarial_chance_level: float | None = None,
+    probe_profile: str = DEFAULT_PROBE_PROFILE,
 ) -> None:
     """
     Train, evaluate, and visualize one CLSM preset.
 
-    The preset is defined by the supplied training module.
+    The preset is defined in the supplied configuration file.
 
     The pipeline:
 
     1. trains the requested preset for all model seeds;
     2. evaluates every trained checkpoint on all available dataset splits;
-    3. saves encoded datasets and split-specific CCA analyses;
-    4. generates manuscript figures for the selected seed;
+    3. saves encoded datasets and, in the full probe profile, CCA analyses;
+    4. generates the available manuscript figures for the selected seed;
     5. generates training diagnostics;
     6. aggregates evaluation metrics across seeds.
     """
@@ -227,6 +293,8 @@ def run_preset_pipeline(
 
     train_command = module_command(
         train_module,
+        "--configurations-file",
+        str(configurations_path),
         "--preset",
         preset,
         "--run-name",
@@ -246,6 +314,20 @@ def run_preset_pipeline(
         str(train_batch_size),
         "--device",
         device,
+    )
+
+    train_command.extend(
+        [
+            "--refresh-pretrain-epochs",
+            str(refresh_pretrain_epochs),
+        ]
+    )
+
+    train_command.extend(
+        [
+            "--adversary-steps",
+            str(adversary_steps),
+        ]
     )
 
     run_command(
@@ -284,6 +366,30 @@ def run_preset_pipeline(
         device,
     )
 
+    evaluation_command.extend(
+        ["--nuisance-probe-epochs",
+         str(nuisance_probe_epochs)]
+    )
+    evaluation_command.extend(
+        ["--probe-profile", str(probe_profile)]
+    )
+    if physical_probe_epochs is not None:
+        evaluation_command.extend(
+            ["--physical-probe-epochs", str(physical_probe_epochs)]
+        )
+    if strong_probe_epochs is not None:
+        evaluation_command.extend(
+            ["--strong-probe-epochs", str(strong_probe_epochs)]
+        )
+    if probe_cache_dir is not None:
+        evaluation_command.extend(
+            ["--probe-cache-dir", str(probe_cache_dir)]
+        )
+    if probe_workers is not None:
+        evaluation_command.extend(
+            ["--probe-workers", str(probe_workers)]
+        )
+
     # evaluation.py only creates an aggregate file when several
     # checkpoints are evaluated
     if len(seeds) > 1:
@@ -310,26 +416,16 @@ def run_preset_pipeline(
     # -------------------------------------------------------------------------
 
     figure_splits = ["test"]
+
     if (data_dir / "ood.npz").exists():
         figure_splits.append("ood")
+
     for split in figure_splits:
         encoded_path = (
-            evaluation_dir
-            / f"{split}_encoded.npz"
+            evaluation_dir / f"{split}_encoded.npz"
         )
 
-        cca_path = (
-            evaluation_dir
-            / f"{split}_cca_analysis.npz"
-        )
-
-        require_file(
-            encoded_path
-        )
-
-        require_file(
-            cca_path
-        )
+        require_file(encoded_path)
 
         # Environment and learned-representation figure
         environment_output = (
@@ -361,37 +457,45 @@ def run_preset_pipeline(
             ),
         )
 
-        # State probes and CCA figure
-        state_output = (
-            preset_figures_dir
-            / (
-                f"{preset}_{split}_"
-                "state_analysis.pdf"
+        if probe_profile == "full":
+            cca_path = (
+                evaluation_dir
+                / f"{split}_cca_analysis.npz"
             )
-        )
 
-        state_command = module_command(
-            "scripts.visualization",
-            "state",
-            "--metrics",
-            str(metrics_path),
-            "--cca",
-            str(cca_path),
-            "--metadata",
-            str(metadata_path),
-            "--split",
-            split,
-            "--output",
-            str(state_output),
-        )
+            require_file(cca_path)
 
-        run_command(
-            state_command,
-            title=(
-                f"VISUALIZING STATE ANALYSIS: "
-                f"{preset} ({split.upper()})"
-            ),
-        )
+            # State probes and CCA figure
+            state_output = (
+                preset_figures_dir
+                / (
+                    f"{preset}_{split}_"
+                    "state_analysis.pdf"
+                )
+            )
+
+            state_command = module_command(
+                "scripts.visualization",
+                "state",
+                "--metrics",
+                str(metrics_path),
+                "--cca",
+                str(cca_path),
+                "--metadata",
+                str(metadata_path),
+                "--split",
+                split,
+                "--output",
+                str(state_output),
+            )
+
+            run_command(
+                state_command,
+                title=(
+                    f"VISUALIZING STATE ANALYSIS: "
+                    f"{preset} ({split.upper()})"
+                ),
+            )
 
     # -------------------------------------------------------------------------
     # Training diagnostics
@@ -552,12 +656,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--configurations-file",
+        type=Path,
+        default=DEFAULT_CONFIGURATIONS_FILE,
+        help="JSON file containing named CLSM constraint configurations.",
+    )
+    parser.add_argument(
         "--presets",
         nargs="+",
         default=None,
         help=(
             "Presets to evaluate. "
-            "Defaults to all presets defined by the training module."
+            "Defaults to all presets defined in --configurations-file."
         ),
     )
     parser.add_argument(
@@ -574,7 +684,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--data-dir",
-        default="data",
+        default=DEFAULT_DATA_DIR,
         help=(
             "Directory containing train.npz, validation.npz, "
             "test.npz, and optionally ood.npz."
@@ -582,17 +692,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--runs-dir",
-        default="runs",
+        default=DEFAULT_RUNS_DIR,
         help="Directory in which checkpoints and metrics are saved.",
     )
     parser.add_argument(
         "--figures-dir",
-        default="figures",
+        default=DEFAULT_FIGURES_DIR,
         help=(
             "Directory in which figures are saved."
         ),
     )
-
+    parser.add_argument(
+        "--probe-profile",
+        choices=PROBE_PROFILES,
+        default=DEFAULT_PROBE_PROFILE,
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_EPOCHS,
+    )
+    parser.add_argument(
+        "--refresh-pretrain-epochs",
+        type=int,
+        default=DEFAULT_REFRESH_PRETRAIN_EPOCHS,
+    )
+    parser.add_argument(
+        "--nuisance-probe-epochs",
+        type=int,
+        default=DEFAULT_NUISANCE_PROBE_EPOCHS,
+    )
+    parser.add_argument(
+        "--device",
+        default=DEFAULT_DEVICE,
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_SEEDS),
+    )
+    parser.add_argument(
+        "--adversary-steps",
+        type=int,
+        default=DEFAULT_ADVERSARY_STEPS,
+    )
+    parser.add_argument(
+        "--probe-workers",
+        type=int,
+        default=DEFAULT_PROBE_WORKERS,
+    )
+    parser.add_argument(
+        "--probe-cache-dir",
+        type=str,
+        default=DEFAULT_PROBE_CACHE_DIR,
+    )
+    parser.add_argument(
+        "--strong-probe-epochs",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--physical-probe-epochs",
+        type=int,
+        default=None,
+    )
     return parser
 
 
@@ -605,8 +769,12 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    configurations = load_configurations(
+        args.configurations_file
+    )
+
     available_presets = tuple(
-        PRESET_WEIGHTS.keys()
+        configurations.keys()
     )
 
     presets = (
@@ -631,9 +799,22 @@ def main() -> None:
             preset,
             args.train_module,
             args.metadata,
+            configurations_path=args.configurations_file,
             data_dir=args.data_dir,
             runs_dir=args.runs_dir,
             figures_dir=args.figures_dir,
+            adversary_steps=args.adversary_steps,
+            probe_workers=args.probe_workers,
+            probe_cache_dir=args.probe_cache_dir,
+            strong_probe_epochs=args.strong_probe_epochs,
+            physical_probe_epochs=args.physical_probe_epochs,
+            epochs=args.epochs,
+            refresh_pretrain_epochs=args.refresh_pretrain_epochs,
+            nuisance_probe_epochs=args.nuisance_probe_epochs,
+            device=args.device,
+            seeds=args.seeds,
+            visualization_seed=args.seeds[0],
+            probe_profile=args.probe_profile,
         )
 
 

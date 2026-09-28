@@ -42,8 +42,8 @@ from clsm.datasets import (
 # Type aliases
 # =============================================================================
 
-FloatArray = NDArray[np.float64]
 Distribution = Literal["id", "ood"]
+FloatArray = NDArray[np.float64]
 
 
 # =============================================================================

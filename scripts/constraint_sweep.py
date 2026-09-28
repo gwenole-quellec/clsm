@@ -1,13 +1,14 @@
 """
-Run a large-scale CLSM weight sweep and analyze all pairwise 2-D Pareto fronts.
+Run the reproducible sweep design and the four selected pairwise Pareto fronts.
 
 Author: Gwenolé Quellec
 Year: 2026
 
 The script samples CLSM constraint weights, trains and evaluates each
 configuration, aggregates results across model seeds, and generates the four
-pairwise Pareto curves retained for the paper induced by the five paper metrics. Pareto-optimal
-configurations receive stable global labels (P1, P2, ...) shared by all figures.
+pairwise Pareto curves retained for the paper induced by the five paper metrics.
+Representative Pareto-optimal configurations receive stable global labels
+(P1, P2, ...) shared by all figures.
 
 Requires ``adjustText`` for automatic label placement.
 
@@ -17,19 +18,18 @@ Run a complete sweep:
 
     python -m scripts.constraint_sweep \
         --train-module toy.train \
-        --num-configurations 100 \
+        --sweep-config toy/constraint_sweep_config.json \
+        --num-configurations 200 \
         --device cuda
 
 Rebuild the aggregate analysis from existing per-run evaluations:
 
     python -m scripts.constraint_sweep \
-        --train-module toy.train \
         --analyze-only
 
-Regenerate the ten pairwise Pareto figures from saved aggregate results:
+Regenerate the four pairwise Pareto figures from saved aggregate results:
 
     python -m scripts.constraint_sweep \
-        --train-module toy.train \
         --figures-only
 """
 
@@ -37,9 +37,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import itertools
 import json
+import math
+import random
+import shutil
 import subprocess
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -48,6 +56,7 @@ import numpy as np
 from adjustText import adjust_text
 from tqdm.auto import tqdm
 
+from clsm.training import INVARIANCE_METHOD
 from clsm.utils import module_command, print_banner, print_separator
 
 
@@ -69,12 +78,61 @@ class SweepWeights:
 class WeightRange:
     minimum: float
     maximum: float
-    zero_probability: float = 0.0
 
 
 # =============================================================================
-# Sweep constants
+# Constants
 # =============================================================================
+
+DEFAULT_NUM_CONFIGURATIONS = 200
+
+DEFAULT_SWEEP_SEED = 12_345
+DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+
+DEFAULT_TRAINING_EPOCHS = 50
+DEFAULT_REFRESH_PRETRAIN_EPOCHS = 40
+DEFAULT_ADVERSARY_STEPS = 15
+
+DEFAULT_NUISANCE_PROBE_EPOCHS = 500
+DEFAULT_PROBE_SEED = 42
+DEFAULT_NONLINEAR_PROBE_MAX_SAMPLES = 25_000
+
+DEFAULT_TRAIN_BATCH_SIZE = 128
+DEFAULT_EVALUATION_BATCH_SIZE = 256
+
+DEFAULT_ROLLOUT_HORIZONS = (1, 5, 10)
+REQUIRED_PARETO_ROLLOUT_HORIZON = 5
+
+DEFAULT_PROBE_WORKERS = 1
+DEFAULT_PROBE_CACHE_DIR = ".probe-cache"
+
+DEFAULT_PARETO_ABSOLUTE_TOLERANCE = 0.0
+DEFAULT_PARETO_RELATIVE_TOLERANCE = 0.0
+DEFAULT_PARETO_LABEL_MINIMUM_DISTANCE = 0.01
+
+DEFAULT_PLOT_OUTLIER_IQR_MULTIPLIER = 1.5
+
+DEFAULT_SWEEP_CONFIG_PATH = Path(
+    "toy/constraint_sweep_config.json"
+)
+
+DEFAULT_RUNS_DIR = Path(
+    "runs_weight_sweep"
+)
+
+DEFAULT_OUTPUT_DIR = Path(
+    "analysis_weight_sweep"
+)
+
+DEFAULT_DATA_DIR = Path(
+    "data"
+)
+
+ANALYSIS_PROTOCOL_ARGUMENTS = (
+    "pareto_absolute_tolerance",
+    "pareto_relative_tolerance",
+    "pareto_label_minimum_distance",
+)
 
 WEIGHT_NAMES = (
     "predictive",
@@ -90,24 +148,24 @@ OBJECTIVES = {
     "rollout_observation_mse_h5": False,
     "state_probe_r2": True,
     "neighborhood_trustworthiness": True,
-    "counterfactual_normalized_mse": False,
-    "conditional_nuisance_probe_accuracy": False,
+    "counterfactual_relative_energy": False,
+    "nuisance_latent_strong_class_balanced_accuracy": False,
 }
 
 OBJECTIVE_LABELS = {
     "rollout_observation_mse_h5": "Prediction MSE (h=5) ↓",
     "state_probe_r2": r"State accessibility ($R^2$) ↑",
     "neighborhood_trustworthiness": "Neighborhood preservation ↑",
-    "counterfactual_normalized_mse": "Counterfactual NMSE ↓",
-    "conditional_nuisance_probe_accuracy": "Conditional nuisance accuracy ↓",
+    "counterfactual_relative_energy": "Counterfactual relative energy ↓",
+    "nuisance_latent_strong_class_balanced_accuracy": "Nuisance balanced accuracy ↓",
 }
 
 OBJECTIVE_SHORT_NAMES = {
     "rollout_observation_mse_h5": "prediction",
     "state_probe_r2": "state_accessibility",
     "neighborhood_trustworthiness": "neighborhood_preservation",
-    "counterfactual_normalized_mse": "counterfactual_consistency",
-    "conditional_nuisance_probe_accuracy": "nuisance_suppression",
+    "counterfactual_relative_energy": "counterfactual_consistency",
+    "nuisance_latent_strong_class_balanced_accuracy": "nuisance_suppression",
 }
 
 # Pairwise Pareto fronts retained for the paper.
@@ -115,15 +173,15 @@ OBJECTIVE_SHORT_NAMES = {
 OBJECTIVE_PAIRS = (
     (
         "rollout_observation_mse_h5",
-        "counterfactual_normalized_mse",
+        "counterfactual_relative_energy",
     ),
     (
         "rollout_observation_mse_h5",
-        "conditional_nuisance_probe_accuracy",
+        "nuisance_latent_strong_class_balanced_accuracy",
     ),
     (
         "neighborhood_trustworthiness",
-        "conditional_nuisance_probe_accuracy",
+        "nuisance_latent_strong_class_balanced_accuracy",
     ),
     (
         "state_probe_r2",
@@ -132,12 +190,12 @@ OBJECTIVE_PAIRS = (
 )
 
 WEIGHT_RANGES = {
-    "predictive": WeightRange(0.05, 2.0, 0.05),
-    "minimality": WeightRange(1e-5, 5e-2, 0.25),
-    "temporal": WeightRange(0.01, 1.5, 0.10),
-    "observation": WeightRange(0.01, 1.5, 0.10),
-    "invariance": WeightRange(1e-3, 2e-1, 0.20),
-    "structural": WeightRange(1e-3, 2e-1, 0.20),
+    "predictive": WeightRange(0.01, 5.0),
+    "minimality": WeightRange(1e-5, 5e-2),
+    "temporal": WeightRange(0.01, 2.0),
+    "observation": WeightRange(0.003, 3.0),
+    "invariance": WeightRange(0.01, 5.0),
+    "structural": WeightRange(1e-3, 1.0),
 }
 
 ANCHOR_CONFIGURATIONS = (
@@ -145,8 +203,8 @@ ANCHOR_CONFIGURATIONS = (
     SweepWeights(0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
     SweepWeights(0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
     SweepWeights(0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
-    SweepWeights(1.0, 0.0, 0.5, 0.5, 0.0, 0.0),
-    SweepWeights(1.0, 0.01, 0.5, 0.5, 0.1, 0.1),
+    *(SweepWeights(1.0, 0.0, 0.5, 0.5, value, 0.0)
+      for value in (0.0, 0.1, 0.3, 1.0, 3.0, 5.0, 10.0)),
 )
 
 
@@ -154,97 +212,206 @@ ANCHOR_CONFIGURATIONS = (
 # Weight sampling
 # =============================================================================
 
-def sample_zero_or_log_uniform(
-    rng: np.random.Generator,
-    *,
-    minimum: float,
-    maximum: float,
-    zero_probability: float,
-) -> float:
-    """Sample zero or a positive log-uniform value."""
-    if rng.random() < zero_probability:
-        return 0.0
-
-    return float(
-        10.0
-        ** rng.uniform(
-            np.log10(minimum),
-            np.log10(maximum),
-        )
-    )
-
-
-def sample_weights(rng: np.random.Generator) -> SweepWeights:
-    """Sample all six CLSM constraint weights."""
-    sampled = {
-        name: sample_zero_or_log_uniform(
-            rng,
-            minimum=weight_range.minimum,
-            maximum=weight_range.maximum,
-            zero_probability=weight_range.zero_probability,
-        )
-        for name, weight_range in WEIGHT_RANGES.items()
-    }
-
-    # Regularization-only objectives are not useful without at least one
-    # information-preserving objective.
-    if (
-        sampled["predictive"]
-        + sampled["temporal"]
-        + sampled["observation"]
-        == 0.0
-    ):
-        name = str(
-            rng.choice(
-                (
-                    "predictive",
-                    "temporal",
-                    "observation",
-                )
-            )
-        )
-        weight_range = WEIGHT_RANGES[name]
-        sampled[name] = sample_zero_or_log_uniform(
-            rng,
-            minimum=weight_range.minimum,
-            maximum=weight_range.maximum,
-            zero_probability=0.0,
-        )
-
-    return SweepWeights(**sampled)
-
-
 def generate_configurations(
     *,
-    num_random_configurations: int,
-    rng: np.random.Generator,
-    include_anchors: bool,
-) -> list[SweepWeights]:
-    """Generate the CLSM hyperparameter sweep configurations."""
-    configurations = []
+    total: int,
+    seed: int,
+    focus_centers: Sequence[Mapping[str, object]],
+    include_anchors: bool = True,
+):
+    """Generate the reproducible quota-based sweep design."""
+    rng = random.Random(seed)
+    configurations, plan, seen = [], [], set()
+
+    def append(values, source, **metadata):
+        key = tuple(round(values[name], 14) for name in WEIGHT_NAMES)
+        if key in seen:
+            return False
+        seen.add(key)
+        index = len(configurations)
+        configurations.append(SweepWeights(**values))
+        plan.append(dict(configuration_id=index, source=source,
+                         zero_weights=[k for k in WEIGHT_NAMES if values[k] == 0], **metadata))
+        return True
 
     if include_anchors:
-        configurations.extend(ANCHOR_CONFIGURATIONS)
+        for w in ANCHOR_CONFIGURATIONS:
+            append(asdict(w), "reference")
+        for center in focus_centers:
+            append(center["weights"].copy(), "pilot_reference", pilot_id=center["pilot_id"])
+    remaining = total - len(configurations)
+    if remaining < 0:
+        raise ValueError("Total is smaller than the number of references")
+    focused = round(remaining * 2 / 3)
+    pair_masks = list(itertools.combinations(WEIGHT_NAMES, 2))
+    for source, count in (("focused", focused), ("broad", remaining-focused)):
+        # Equal single-zero quotas across the six constraints; rounding goes to all-positive.
+        singles_each = int(count * 0.4) // 6
+        doubles = round(count * 0.2)
+        masks = [()] * (count - 6*singles_each - doubles)
+        masks += [(name,) for name in WEIGHT_NAMES for _ in range(singles_each)]
+        pairs = pair_masks.copy()
+        rng.shuffle(pairs)
+        masks += [pairs[i % len(pairs)] for i in range(doubles)]
+        rng.shuffle(masks)
+        centers = [
+            focus_centers[
+                i % len(focus_centers)
+            ]
+            for i in range(count)
+        ]
+        rng.shuffle(centers)
+        for mask, center in zip(masks, centers):
+            for attempt in range(1000):
+                values = {}
+                for name in WEIGHT_NAMES:
+                    if name in mask:
+                        values[name] = 0.0
+                        continue
+                    bounds = WEIGHT_RANGES[name]
+                    lo, hi = math.log10(bounds.minimum), math.log10(bounds.maximum)
+                    central = center['weights'][name]
+                    if source == "focused" and central > 0:
+                        lo = max(lo, math.log10(central) - 0.5)
+                        hi = min(hi, math.log10(central) + 0.5)
+                    # A zero pilot weight activated by the quota uses the global positive interval.
+                    values[name] = 10 ** rng.uniform(lo, hi)
+                if append(values, source, pilot_id=center['pilot_id'] if source == "focused" else None):
+                    break
+            else:
+                raise RuntimeError("Could not generate a unique configuration")
+    assert len(configurations) == total
+    return configurations, plan
 
-    configurations.extend(
-        sample_weights(rng)
-        for _ in range(num_random_configurations)
-    )
 
-    unique = {}
-    for weights in configurations:
-        key = tuple(
-            round(getattr(weights, name), 12)
-            for name in WEIGHT_NAMES
+def load_sweep_config(
+    path: Path,
+) -> dict[str, object]:
+    """Load and validate the sweep sampling configuration."""
+
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+
+    if not isinstance(
+        payload,
+        dict,
+    ):
+        raise TypeError(
+            f"Expected a JSON object in {path}."
         )
-        unique[key] = weights
 
-    return list(unique.values())
+    if payload.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported sweep configuration schema in {path}."
+        )
+
+    focus_centers = payload.get("focus_centers")
+
+    if not isinstance(
+        focus_centers,
+        list,
+    ) or not focus_centers:
+        raise ValueError(
+            f"{path} must contain a non-empty 'focus_centers' list."
+        )
+
+    for index, center in enumerate(focus_centers):
+        if not isinstance(
+            center,
+            dict,
+        ):
+            raise TypeError(
+                f"Focus center {index} must be an object."
+            )
+
+        if "pilot_id" not in center:
+            raise KeyError(
+                f"Focus center {index} has no 'pilot_id'."
+            )
+
+        weights = center.get("weights")
+
+        if not isinstance(
+            weights,
+            dict,
+        ):
+            raise TypeError(
+                f"Focus center {index} has no valid 'weights' object."
+            )
+
+        missing = set(WEIGHT_NAMES).difference(weights)
+        extra = set(weights).difference(WEIGHT_NAMES)
+
+        if missing or extra:
+            raise ValueError(
+                f"Invalid weights for focus center {index}: "
+                f"missing={sorted(missing)}, extra={sorted(extra)}."
+            )
+
+        for name in WEIGHT_NAMES:
+            value = float(weights[name])
+
+            if value < 0.0:
+                raise ValueError(
+                    f"Negative weight '{name}' in focus center {index}."
+                )
+
+    return payload
 
 
 # =============================================================================
 # External command execution
 # =============================================================================
+
+def build_evaluation_command(
+    *,
+    checkpoint_path: Path,
+    data_dir: Path,
+    batch_size: int,
+    rollout_horizons: Sequence[int],
+    device: str,
+    probe_workers: int = DEFAULT_PROBE_WORKERS,
+    probe_cache_dir: str = DEFAULT_PROBE_CACHE_DIR,
+    strong_probe_epochs: int | None = None,
+    physical_probe_epochs: int | None = None,
+    probe_profile: str = "pareto",
+    nuisance_probe_epochs: int = DEFAULT_NUISANCE_PROBE_EPOCHS,
+) -> list[str]:
+    """Build the command invoking the evaluation module."""
+    command = module_command(
+        "scripts.evaluation",
+        "--checkpoint",
+        str(checkpoint_path),
+        "--data-dir",
+        str(data_dir),
+        "--split",
+        "validation",
+        "--nuisance-probe-epochs",
+        str(nuisance_probe_epochs),
+        "--batch-size",
+        str(batch_size),
+        "--rollout-horizons",
+        *[str(horizon) for horizon in rollout_horizons],
+        "--device",
+        device,
+    )
+
+    if probe_workers is not None:
+        command.extend(["--probe-workers", str(probe_workers)])
+
+    if probe_cache_dir is not None:
+        command.extend(["--probe-cache-dir", str(probe_cache_dir)])
+
+    if strong_probe_epochs is not None:
+        command.extend(["--strong-probe-epochs", str(strong_probe_epochs)])
+
+    if physical_probe_epochs is not None:
+        command.extend(["--physical-probe-epochs", str(physical_probe_epochs)])
+
+    if probe_profile is not None:
+        command.extend(["--probe-profile", str(probe_profile)])
+    return command
+
 
 def build_train_command(
     *,
@@ -257,12 +424,13 @@ def build_train_command(
     batch_size: int,
     device: str,
     weights: SweepWeights,
+    adversary_steps: int = DEFAULT_ADVERSARY_STEPS,
+    refresh_pretrain_epochs: int = DEFAULT_REFRESH_PRETRAIN_EPOCHS,
 ) -> list[str]:
     """Build the command invoking the training module."""
+
     command = module_command(
         train_module,
-        "--preset",
-        "full",
         "--run-name",
         run_name,
         "--output-dir",
@@ -279,41 +447,31 @@ def build_train_command(
         device,
     )
 
+    command.extend(
+        [
+            "--refresh-pretrain-epochs",
+            str(refresh_pretrain_epochs),
+        ]
+    )
+
+    command.extend(
+        [
+            "--adversary-steps",
+            str(adversary_steps),
+        ]
+    )
+
     for name in WEIGHT_NAMES:
         command.extend(
             [
                 f"--weight-{name}",
-                str(getattr(weights, name)),
+                str(
+                    getattr(weights, name)
+                ),
             ]
         )
 
     return command
-
-
-def build_evaluation_command(
-    *,
-    checkpoint_path: Path,
-    data_dir: Path,
-    batch_size: int,
-    rollout_horizons: Sequence[int],
-    device: str,
-) -> list[str]:
-    """Build the command invoking the evaluation module."""
-    return module_command(
-        "scripts.evaluation",
-        "--checkpoint",
-        str(checkpoint_path),
-        "--data-dir",
-        str(data_dir),
-        "--split",
-        "all",
-        "--batch-size",
-        str(batch_size),
-        "--rollout-horizons",
-        *[str(horizon) for horizon in rollout_horizons],
-        "--device",
-        device,
-    )
 
 
 def run_command(command: Sequence[str], *, title: str) -> None:
@@ -340,6 +498,115 @@ def run_command(command: Sequence[str], *, title: str) -> None:
 # =============================================================================
 # Sweep result I/O
 # =============================================================================
+
+def load_configuration_results(output_dir: Path) -> list[dict[str, object]]:
+    """Load previously aggregated sweep results."""
+    path = output_dir / "sweep_configuration_results.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            "Cannot generate figures because aggregated sweep results are "
+            f"missing: {path}"
+        )
+
+    with path.open("r", encoding="utf-8") as stream:
+        records = json.load(stream)
+
+    if not isinstance(records, list):
+        raise TypeError(f"Expected a list of records in {path}.")
+
+    required = {
+        "configuration_id",
+        *WEIGHT_NAMES,
+        *OBJECTIVES,
+    }
+
+    for index, record in enumerate(records):
+        missing = required.difference(record)
+        if missing:
+            raise KeyError(
+                f"Record {index} in {path} is missing: {sorted(missing)}"
+            )
+
+    return records
+
+
+def load_search_protocol(output_dir: Path) -> dict[str, object]:
+    """Load the immutable protocol of an existing sweep."""
+    path = search_protocol_path(output_dir)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Search protocol not found: {path}"
+        )
+
+    with path.open("r", encoding="utf-8") as stream:
+        protocol = json.load(stream)
+
+    if not isinstance(protocol, dict):
+        raise TypeError(
+            f"Expected a JSON object in {path}."
+        )
+
+    return protocol
+
+
+def load_sweep_manifest(
+    output_dir: Path,
+) -> list[dict[str, object]]:
+    """Load the immutable manifest of an existing sweep."""
+
+    path = (
+        output_dir
+        / "sweep_manifest.json"
+    )
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Sweep manifest not found: {path}"
+        )
+
+    with path.open("r", encoding="utf-8") as stream:
+        records = json.load(
+            stream
+        )
+
+    if not isinstance(records, list):
+        raise TypeError(
+            f"Expected a list of records in {path}."
+        )
+
+    return records
+
+
+def load_validation_objectives(metrics_path: Path) -> dict[str, float]:
+    """Load validation metrics only; reject legacy nuisance definitions."""
+    with metrics_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+
+    if "validation" not in payload:
+        raise KeyError(f"'validation' split missing from {metrics_path}.")
+
+    if payload["validation"].get("nuisance_metric_version") != 2.0:
+        raise ValueError("Legacy evaluation: rerun with the independent v2 nuisance probes")
+    objectives = {}
+    for metric_name in OBJECTIVES:
+        value = payload["validation"].get(metric_name)
+        if value is None:
+            raise ValueError(
+                f"Metric '{metric_name}' is missing or invalid in "
+                f"{metrics_path}."
+            )
+
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(
+                f"Metric '{metric_name}' is non-finite in {metrics_path}."
+            )
+
+        objectives[metric_name] = value
+
+    return objectives
+
 
 def save_records(
     records: Sequence[Mapping[str, object]],
@@ -377,63 +644,70 @@ def save_records(
         writer.writerows(records)
 
 
-def load_test_objectives(metrics_path: Path) -> dict[str, float]:
-    """Load the five paper metrics from one evaluation file."""
-    with metrics_path.open("r", encoding="utf-8") as stream:
-        payload = json.load(stream)
+def save_search_protocol_once(
+    *,
+    output_dir: Path,
+    args: argparse.Namespace,
+    sampling_plan: Sequence[Mapping[str, object]],
+    focus_centers: Sequence[Mapping[str, object]],
+) -> None:
+    """Create the sweep protocol once; never overwrite it."""
+    path = search_protocol_path(output_dir)
 
-    if "test" not in payload:
-        raise KeyError(f"'test' split missing from {metrics_path}.")
+    if path.exists():
+        return
 
-    objectives = {}
-    for metric_name in OBJECTIVES:
-        value = payload["test"].get(metric_name)
-        if value is None:
-            raise ValueError(
-                f"Metric '{metric_name}' is missing or invalid in "
-                f"{metrics_path}."
-            )
+    train_module_path = Path(
+        *args.train_module.split(".")
+    ).with_suffix(".py")
 
-        value = float(value)
-        if not np.isfinite(value):
-            raise ValueError(
-                f"Metric '{metric_name}' is non-finite in {metrics_path}."
-            )
-
-        objectives[metric_name] = value
-
-    return objectives
-
-
-def load_configuration_results(output_dir: Path) -> list[dict[str, object]]:
-    """Load previously aggregated sweep results."""
-    path = output_dir / "sweep_configuration_results.json"
-    if not path.exists():
-        raise FileNotFoundError(
-            "Cannot generate figures because aggregated sweep results are "
-            f"missing: {path}"
-        )
-
-    with path.open("r", encoding="utf-8") as stream:
-        records = json.load(stream)
-
-    if not isinstance(records, list):
-        raise TypeError(f"Expected a list of records in {path}.")
-
-    required = {
-        "configuration_id",
-        *WEIGHT_NAMES,
-        *OBJECTIVES,
+    payload = {
+        "release": "clsm-weight-sweep-2",
+        "arguments": vars(args),
+        "sweep_config": {
+            "path": str(args.sweep_config),
+            "sha256": sha256_file(args.sweep_config),
+        },
+        "weight_ranges": {
+            name: asdict(weight_range)
+            for name, weight_range in WEIGHT_RANGES.items()
+        },
+        "anchors": [
+            asdict(weights)
+            for weights in ANCHOR_CONFIGURATIONS
+        ],
+        "selection_split": "validation",
+        "sampling_plan": sampling_plan,
+        "focus_centers": list(focus_centers),
+        "source_sha256": {
+            "scripts/constraint_sweep.py": sha256_file(Path(__file__)),
+            "clsm/training.py": sha256_file(Path("clsm/training.py")),
+            "clsm/models.py": sha256_file(Path("clsm/models.py")),
+            "clsm/losses.py": sha256_file(Path("clsm/losses.py")),
+            "clsm/refresh.py": sha256_file(Path("clsm/refresh.py")),
+            str(train_module_path): sha256_file(train_module_path),
+        },
+        "local_log10_half_width": 0.5,
     }
 
-    for index, record in enumerate(records):
-        missing = required.difference(record)
-        if missing:
-            raise KeyError(
-                f"Record {index} in {path} is missing: {sorted(missing)}"
-            )
+    path.write_text(
+        json.dumps(
+            payload,
+            default=str,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
-    return records
+
+def search_protocol_path(output_dir: Path) -> Path:
+    """Return the immutable search protocol path for one sweep."""
+    return output_dir / "search_protocol.json"
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 # =============================================================================
@@ -481,6 +755,36 @@ def aggregate_configuration_records(
 # =============================================================================
 # Pareto analysis
 # =============================================================================
+
+def load_analysis_protocol_arguments(
+    output_dir: Path,
+) -> dict[str, object]:
+    """Load figure/Pareto settings from the original sweep protocol."""
+    protocol = load_search_protocol(output_dir)
+
+    arguments = protocol.get("arguments")
+    if not isinstance(arguments, dict):
+        raise KeyError(
+            "search_protocol.json does not contain a valid "
+            "'arguments' object."
+        )
+
+    missing = [
+        name
+        for name in ANALYSIS_PROTOCOL_ARGUMENTS
+        if name not in arguments
+    ]
+    if missing:
+        raise KeyError(
+            "Missing analysis settings in search_protocol.json: "
+            + ", ".join(missing)
+        )
+
+    return {
+        name: arguments[name]
+        for name in ANALYSIS_PROTOCOL_ARGUMENTS
+    }
+
 
 def oriented_pair_matrix(
     records: Sequence[Mapping[str, object]],
@@ -566,8 +870,6 @@ def pairwise_pareto_mask(
 # Pairwise Pareto plots
 # =============================================================================
 
-
-
 def representative_pareto_mask(
     records: Sequence[Mapping[str, object]],
     pareto: np.ndarray,
@@ -636,6 +938,7 @@ def representative_pareto_mask(
 
     return representative
 
+
 def build_global_pareto_labels(
     records: Sequence[Mapping[str, object]],
     *,
@@ -649,16 +952,17 @@ def build_global_pareto_labels(
     dict[tuple[str, str], np.ndarray],
     dict[int, str],
 ]:
-    """Compute all pairwise fronts and assign stable global labels.
+    """Compute pairwise Pareto fronts and assign stable global labels.
 
-    A configuration receives one label, such as P1, and keeps that label in
-    every figure in which it appears. Labels are assigned by increasing
-    configuration identifier over the union of all pairwise Pareto sets.
+    A configuration receives one label, such as P1, and keeps that label
+    across figures. Labels are assigned by increasing configuration
+    identifier over the union of panel-specific representative Pareto points.
     """
+
     pair_masks = {}
     pair_inlier_masks = {}
     pair_representative_masks = {}
-    pareto_configuration_ids = set()
+    representative_configuration_ids = set()
 
     for x_metric, y_metric in OBJECTIVE_PAIRS:
         x_values = np.asarray(
@@ -670,30 +974,24 @@ def build_global_pareto_labels(
             dtype=float,
         )
 
-        inliers = pairwise_inlier_mask(
-            x_values,
-            y_values,
-            iqr_multiplier=outlier_iqr_multiplier,
-        )
-        pair_inlier_masks[(x_metric, y_metric)] = inliers
-
-        inlier_records = [
-            record
-            for record, keep in zip(records, inliers, strict=True)
-            if keep
-        ]
-
-        inlier_pareto = pairwise_pareto_mask(
-            inlier_records,
+        # Pareto front: always computed from all configurations.
+        mask = pairwise_pareto_mask(
+            records,
             x_metric=x_metric,
             y_metric=y_metric,
             absolute_tolerance=absolute_tolerance,
             relative_tolerance=relative_tolerance,
         )
-
-        mask = np.zeros(len(records), dtype=bool)
-        mask[np.flatnonzero(inliers)] = inlier_pareto
         pair_masks[(x_metric, y_metric)] = mask
+
+        # Visualization-only outlier filtering for dominated configurations.
+        plot_inliers = pairwise_inlier_mask(
+            x_values,
+            y_values,
+            iqr_multiplier=outlier_iqr_multiplier,
+        )
+        plot_inliers |= mask
+        pair_inlier_masks[(x_metric, y_metric)] = plot_inliers
 
         representative = representative_pareto_mask(
             records,
@@ -704,7 +1002,7 @@ def build_global_pareto_labels(
         )
         pair_representative_masks[(x_metric, y_metric)] = representative
 
-        pareto_configuration_ids.update(
+        representative_configuration_ids.update(
             int(record["configuration_id"])
             for record, is_representative in zip(
                 records,
@@ -717,12 +1015,17 @@ def build_global_pareto_labels(
     labels = {
         configuration_id: f"P{label_index}"
         for label_index, configuration_id in enumerate(
-            sorted(pareto_configuration_ids),
+            sorted(representative_configuration_ids),
             start=1,
         )
     }
 
-    return pair_masks, pair_inlier_masks, pair_representative_masks, labels
+    return (
+        pair_masks,
+        pair_inlier_masks,
+        pair_representative_masks,
+        labels,
+    )
 
 
 def global_pareto_configuration_records(
@@ -757,6 +1060,7 @@ def global_pareto_configuration_records(
     )
     return rows
 
+
 def ordered_front_indices(
     records: Sequence[Mapping[str, object]],
     pareto: np.ndarray,
@@ -776,18 +1080,18 @@ def ordered_front_indices(
     return indices[np.argsort(oriented_x)]
 
 
-
 def pairwise_inlier_mask(
     x_values: np.ndarray,
     y_values: np.ndarray,
     *,
     iqr_multiplier: float,
 ) -> np.ndarray:
-    """Return configurations retained for one pairwise Pareto analysis.
+    """Return configurations retained for visualization.
 
-    Tukey fences are estimated independently on both metrics using all
-    configurations. Points outside either fence are excluded before the
-    Pareto set is computed. A negative multiplier disables filtering.
+    Tukey fences are estimated independently on both displayed metrics.
+    Dominated configurations outside either fence may be hidden from the plot.
+    Pareto computation itself is unaffected. A negative multiplier disables
+    filtering.
     """
     x_values = np.asarray(x_values, dtype=float)
     y_values = np.asarray(y_values, dtype=float)
@@ -959,7 +1263,7 @@ def plot_pairwise_pareto(
     figure.savefig(output_path, bbox_inches="tight")
     plt.close(figure)
 
-    pareto_solutions = [
+    representative_pareto_solutions = [
         {
             "label": labels[int(records[index]["configuration_id"])],
             "configuration_id": int(records[index]["configuration_id"]),
@@ -981,11 +1285,11 @@ def plot_pairwise_pareto(
         "n_labeled_pareto": int(np.sum(representative)),
         "pareto_fraction": float(np.mean(pareto)),
         "n_excluded_outliers": n_excluded_outliers,
-        "pareto_configuration_ids": [
+        "representative_pareto_configuration_ids": [
             solution["configuration_id"]
-            for solution in pareto_solutions
+            for solution in representative_pareto_solutions
         ],
-        "pareto_solutions": pareto_solutions,
+        "representative_pareto_solutions": representative_pareto_solutions,
     }
 
     return output_path, summary
@@ -1048,7 +1352,7 @@ def generate_analysis_figures(
     list[dict[str, object]],
     dict[int, str],
 ]:
-    """Generate the ten pairwise Pareto figures."""
+    """Generate the four pairwise Pareto figures."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     (
@@ -1076,21 +1380,179 @@ def generate_analysis_figures(
     return paths, summaries, labels
 
 
+def print_representative_pareto_solutions(
+    summaries: Sequence[Mapping[str, object]],
+) -> None:
+    """Print all representative pairwise Pareto solutions and their six weights."""
+    for summary in summaries:
+        print()
+        print(
+            f"{summary['x_metric']} vs {summary['y_metric']} "
+            f"({summary['n_pareto']} Pareto solutions; "
+            f"{summary['n_labeled_pareto']} labeled representatives; "
+            f"{summary['n_excluded_outliers']} dominated outliers hidden in plot)"
+        )
+        print("-" * 96)
+
+        for solution in summary["representative_pareto_solutions"]:
+            weights = ", ".join(
+                f"{name}={float(solution[name]):.4g}"
+                for name in WEIGHT_NAMES
+            )
+            print(
+                f"{solution['label']} | "
+                f"config {int(solution['configuration_id']):04d} | "
+                f"{summary['x_metric']}="
+                f"{float(solution[summary['x_metric']]):.6g} | "
+                f"{summary['y_metric']}="
+                f"{float(solution[summary['y_metric']]):.6g} | "
+                f"{weights}"
+            )
+
+
+def save_table4(
+    rows: Sequence[Mapping[str, object]],
+    output_dir: Path,
+) -> None:
+    """Export Table 4 with the same P labels and panel memberships as the figures."""
+
+    headers = [
+        "Configuration",
+        *WEIGHT_NAMES,
+        "Panels",
+    ]
+
+    markdown_lines = [
+        "# Table 4 — Representative pairwise Pareto configurations",
+        "",
+        (
+            "Weights of configurations labeled in the four panels. "
+            "Membership is based on validation metrics averaged across "
+            "model seeds."
+        ),
+        "",
+        "| " + " | ".join(headers) + " |",
+        "|" + "---|" * len(headers),
+    ]
+
+    latex_lines = [
+        r"\begin{table}[htbp]",
+        r"  \centering",
+        (
+            r"  \caption{Constraint weights of representative configurations "
+            r"on the empirical pairwise Pareto fronts. Panel membership refers "
+            r"to the validation fronts.}"
+        ),
+        r"  \label{tab:pareto-weights}",
+        r"  \begin{tabular}{lrrrrrrl}",
+        r"    \hline",
+        (
+            r"    Configuration & "
+            r"$\lambda_{\rm pred}$ & "
+            r"$\lambda_{\rm min}$ & "
+            r"$\lambda_{\rm temp}$ & "
+            r"$\lambda_{\rm obs}$ & "
+            r"$\lambda_{\rm inv}$ & "
+            r"$\lambda_{\rm struct}$ & "
+            r"Panels \\"
+        ),
+        r"    \hline",
+    ]
+
+    for row in rows:
+        markdown_values = [
+            str(
+                row["label"]
+            ),
+            *(
+                f"{float(row[name]):.6g}"
+                for name in WEIGHT_NAMES
+            ),
+            str(
+                row["panels"]
+            ),
+        ]
+
+        markdown_lines.append(
+            "| "
+            + " | ".join(
+                markdown_values
+            )
+            + " |"
+        )
+
+        latex_values = [
+            str(
+                row["label"]
+            ),
+            *(
+                f"{float(row[name]):.3g}"
+                for name in WEIGHT_NAMES
+            ),
+            str(
+                row["panels"]
+            ),
+        ]
+
+        latex_lines.append(
+            "    "
+            + " & ".join(
+                latex_values
+            )
+            + r" \\"
+        )
+
+    latex_lines.extend(
+        [
+            r"    \hline",
+            r"  \end{tabular}",
+            r"\end{table}",
+        ]
+    )
+
+    markdown_path = output_dir / "table4.md"
+
+    latex_path = output_dir / "table4.tex"
+
+    markdown_path.write_text(
+        "\n".join(
+            markdown_lines
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    latex_path.write_text(
+        "\n".join(
+            latex_lines
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
 
 def save_global_pareto_configurations(
     records: Sequence[Mapping[str, object]],
     labels: Mapping[int, str],
     *,
     output_dir: Path,
+    summaries: Sequence[Mapping[str, object]],
 ) -> None:
     """Save the global P-label-to-configuration correspondence."""
     rows = global_pareto_configuration_records(records, labels)
+    for row in rows:
+        row["panels"] = ", ".join(
+            f"({chr(97 + index)})" for index, summary in enumerate(summaries)
+            if row["configuration_id"] in summary["representative_pareto_configuration_ids"]
+        )
+    save_table4(rows, output_dir)
 
     save_records(
         rows,
         json_path=output_dir / "pareto_configurations.json",
         csv_path=output_dir / "pareto_configurations.csv",
     )
+
 
 def save_pareto_summaries(
     summaries: Sequence[Mapping[str, object]],
@@ -1115,11 +1577,11 @@ def save_pareto_summaries(
             **{
                 key: value
                 for key, value in summary.items()
-                if key != "pareto_configuration_ids"
+                if key != "representative_pareto_configuration_ids"
             },
-            "pareto_configuration_ids": ",".join(
+            "representative_pareto_configuration_ids": ",".join(
                 str(configuration_id)
-                for configuration_id in summary["pareto_configuration_ids"]
+                for configuration_id in summary["representative_pareto_configuration_ids"]
             ),
         }
         for summary in summaries
@@ -1130,36 +1592,6 @@ def save_pareto_summaries(
         json_path=output_dir / "pareto_2d_summary_flat.json",
         csv_path=output_dir / "pareto_2d_summary.csv",
     )
-
-
-def print_pareto_solutions(
-    summaries: Sequence[Mapping[str, object]],
-) -> None:
-    """Print all pairwise Pareto solutions and their six weights."""
-    for summary in summaries:
-        print()
-        print(
-            f"{summary['x_metric']} vs {summary['y_metric']} "
-            f"({summary['n_pareto']} Pareto solutions; "
-            f"{summary['n_labeled_pareto']} labeled representatives; "
-            f"{summary['n_excluded_outliers']} outliers excluded before analysis)"
-        )
-        print("-" * 96)
-
-        for solution in summary["pareto_solutions"]:
-            weights = ", ".join(
-                f"{name}={float(solution[name]):.4g}"
-                for name in WEIGHT_NAMES
-            )
-            print(
-                f"{solution['label']} | "
-                f"config {int(solution['configuration_id']):04d} | "
-                f"{summary['x_metric']}="
-                f"{float(solution[summary['x_metric']]):.6g} | "
-                f"{summary['y_metric']}="
-                f"{float(solution[summary['y_metric']]):.6g} | "
-                f"{weights}"
-            )
 
 
 # =============================================================================
@@ -1174,39 +1606,84 @@ def build_arg_parser() -> argparse.ArgumentParser:
         )
     )
 
-    parser.add_argument("--num-configurations", type=int, default=100)
-    parser.add_argument("--sweep-seed", type=int, default=12345)
-    parser.add_argument("--model-seeds", type=int, nargs="+", default=[0])
+    parser.add_argument(
+        "--num-configurations",
+        type=int,
+        default=DEFAULT_NUM_CONFIGURATIONS,
+        help="Total number of configurations, including anchors."
+    )
+    parser.add_argument(
+        "--sweep-config",
+        type=Path,
+        default=DEFAULT_SWEEP_CONFIG_PATH,
+        help=(
+            "JSON file defining the pilot focus centers "
+            "used by the sweep sampler."
+        ),
+    )
+    parser.add_argument(
+        "--sweep-seed",
+        type=int,
+        default=DEFAULT_SWEEP_SEED
+    )
+    parser.add_argument(
+        "--model-seeds",
+        type=int,
+        nargs="+",
+        default=DEFAULT_MODEL_SEEDS
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data"),
+        default=DEFAULT_DATA_DIR,
     )
     parser.add_argument(
         "--train-module",
-        required=True,
+        default=None,
         help="Training module to execute.",
     )
     parser.add_argument(
         "--runs-dir",
         type=Path,
-        default=Path("runs"),
+        default=DEFAULT_RUNS_DIR,
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/constraint-sweep-analysis"),
+        default=DEFAULT_OUTPUT_DIR,
     )
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--train-batch-size", type=int, default=128)
-    parser.add_argument("--evaluation-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_TRAINING_EPOCHS
+    )
+    parser.add_argument(
+        "--refresh-pretrain-epochs",
+        type=int,
+        default=DEFAULT_REFRESH_PRETRAIN_EPOCHS
+    )
+    parser.add_argument(
+        "--nuisance-probe-epochs",
+        type=int,
+        default=DEFAULT_NUISANCE_PROBE_EPOCHS
+    )
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=DEFAULT_TRAIN_BATCH_SIZE
+    )
+    parser.add_argument(
+        "--evaluation-batch-size",
+        type=int,
+        default=DEFAULT_EVALUATION_BATCH_SIZE
+    )
     parser.add_argument(
         "--rollout-horizons",
         type=int,
         nargs="+",
-        default=[1, 5, 10],
+        default=DEFAULT_ROLLOUT_HORIZONS,
     )
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--include-anchors",
         action=argparse.BooleanOptionalAction,
@@ -1220,33 +1697,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pareto-absolute-tolerance",
         type=float,
-        default=0.0,
+        default=DEFAULT_PARETO_ABSOLUTE_TOLERANCE,
     )
     parser.add_argument(
         "--pareto-relative-tolerance",
         type=float,
-        default=0.0,
+        default=DEFAULT_PARETO_RELATIVE_TOLERANCE,
     )
     parser.add_argument(
         "--plot-outlier-iqr-multiplier",
         type=float,
-        default=1.0,
+        default=DEFAULT_PLOT_OUTLIER_IQR_MULTIPLIER,
         help=(
-            "Exclude configurations outside Tukey fences on either axis before "
-            "computing each 2-D Pareto front. Use a negative value to disable "
-            "filtering."
+            "Hide dominated configurations outside Tukey fences on either axis "
+            "for visualization only. Pareto configurations are always retained "
+            "and Pareto fronts are computed from all configurations. "
+            "Use a negative value to disable filtering."
         ),
     )
     parser.add_argument(
         "--pareto-label-minimum-distance",
         type=float,
-        default=0.01,
+        default=DEFAULT_PARETO_LABEL_MINIMUM_DISTANCE,
         help=(
-            "Minimum Euclidean distance between labeled Pareto solutions "
-            "after min-max normalization of the displayed metrics. The full "
-            "front remains plotted; only representative solutions are named. "
-            "Use 0 to label every Pareto solution."
+            "Minimum Euclidean spacing used to select intermediate labeled "
+            "Pareto solutions after min-max normalization of the displayed "
+            "metrics. Front endpoints are always retained. The full front "
+            "remains plotted. Use 0 to label every Pareto solution."
         ),
+    )
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        default=None,
+        help="Stop scheduling when this file exists; finish active work and save results."
+    )
+    parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Overlap one evaluation with the next training; same evaluation device."
+    )
+    parser.add_argument(
+        "--restart-incomplete",
+        action="store_true",
+        help="Archive a partial training directory without best.pt and restart only that run."
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -1261,11 +1755,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--figures-only",
         action="store_true",
         help=(
-            "Generate the ten pairwise Pareto figures directly from the "
+            "Generate the four pairwise Pareto figures directly from the "
             "existing sweep_configuration_results.json file."
         ),
     )
 
+    parser.add_argument("--adversary-steps", type=int, default=DEFAULT_ADVERSARY_STEPS)
+    parser.add_argument("--probe-workers", type=int, default=DEFAULT_PROBE_WORKERS)
+    parser.add_argument("--probe-cache-dir", type=str, default=DEFAULT_PROBE_CACHE_DIR)
+    parser.add_argument("--strong-probe-epochs", type=int, default=None)
+    parser.add_argument("--physical-probe-epochs", type=int, default=None)
+    parser.add_argument("--probe-profile", type=str, default="pareto")
     return parser
 
 
@@ -1278,85 +1778,260 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.analyze_only and args.figures_only:
-        parser.error("--analyze-only and --figures-only are mutually exclusive.")
-
-    if args.num_configurations < 0:
-        parser.error("--num-configurations must be non-negative.")
-    if not args.model_seeds:
-        parser.error("At least one model seed must be provided.")
-    if len(set(args.model_seeds)) != len(args.model_seeds):
-        parser.error("--model-seeds must be unique.")
-    if 5 not in args.rollout_horizons:
         parser.error(
-            "The five-metric analysis requires rollout horizon 5."
+            "--analyze-only and --figures-only are mutually exclusive."
         )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if args.figures_only:
-        records = load_configuration_results(args.output_dir)
+        records = load_configuration_results(
+            args.output_dir
+        )
+
+        analysis_arguments = load_analysis_protocol_arguments(
+            args.output_dir
+        )
+
         figure_paths, summaries, labels = generate_analysis_figures(
             records,
             output_dir=args.output_dir / "figures",
-            absolute_tolerance=args.pareto_absolute_tolerance,
-            relative_tolerance=args.pareto_relative_tolerance,
+            absolute_tolerance=float(
+                analysis_arguments[
+                    "pareto_absolute_tolerance"
+                ]
+            ),
+            relative_tolerance=float(
+                analysis_arguments[
+                    "pareto_relative_tolerance"
+                ]
+            ),
             outlier_iqr_multiplier=args.plot_outlier_iqr_multiplier,
-            label_minimum_distance=args.pareto_label_minimum_distance,
+            label_minimum_distance=float(
+                analysis_arguments[
+                    "pareto_label_minimum_distance"
+                ]
+            ),
         )
+
         save_pareto_summaries(
             summaries,
             output_dir=args.output_dir,
         )
+
         save_global_pareto_configurations(
             records,
             labels,
+            summaries=summaries,
             output_dir=args.output_dir,
         )
-        print_pareto_solutions(summaries)
+
+        print(
+            "Using Pareto settings from the original search_protocol.json; "
+            "plot-only outlier filtering uses the current CLI setting."
+        )
+
+        print_representative_pareto_solutions(summaries)
 
         print()
         print_separator()
-        print("FIGURE GENERATION COMPLETED")
-        print(f"Configurations : {len(records)}")
-        print(f"Pareto fronts  : {len(summaries)}")
+        print(
+            "FIGURE GENERATION COMPLETED"
+        )
+        print(
+            f"Configurations : {len(records)}"
+        )
+        print(
+            f"Pareto fronts  : {len(summaries)}"
+        )
+
         for summary in summaries:
             print(
-                f"  {summary['x_metric']} vs {summary['y_metric']}: "
-                f"{summary['n_pareto']}/{summary['n_configurations']} "
+                f"  {summary['x_metric']} vs "
+                f"{summary['y_metric']}: "
+                f"{summary['n_pareto']}/"
+                f"{summary['n_configurations']} "
                 f"({summary['pareto_fraction']:.3f})"
             )
-        print(f"Figures dir    : {args.output_dir / 'figures'}")
+
+        print(
+            f"Figures dir    : "
+            f"{args.output_dir / 'figures'}"
+        )
+
         print_separator()
         return
 
-    rng = np.random.default_rng(args.sweep_seed)
-    configurations = generate_configurations(
-        num_random_configurations=args.num_configurations,
-        rng=rng,
-        include_anchors=args.include_anchors,
-    )
+    if (
+        not args.analyze_only
+        and args.train_module is None
+    ):
+        parser.error(
+            "--train-module is required when running training and evaluation."
+        )
 
-    manifest_records = []
-    for configuration_id, weights in enumerate(configurations):
-        for model_seed in args.model_seeds:
-            run_name = (
-                f"constraint-sweep/config-{configuration_id:04d}/"
-                f"seed-{model_seed}"
-            )
-            manifest_records.append(
-                {
-                    "configuration_id": configuration_id,
-                    "run_name": run_name,
-                    "model_seed": model_seed,
-                    **asdict(weights),
-                }
+    if args.analyze_only:
+        protocol = load_search_protocol(
+            args.output_dir
+        )
+
+        protocol_arguments = protocol.get(
+            "arguments"
+        )
+
+        if not isinstance(
+            protocol_arguments,
+            dict,
+        ):
+            raise KeyError(
+                "search_protocol.json does not contain "
+                "a valid 'arguments' object."
             )
 
-    save_records(
-        manifest_records,
-        json_path=args.output_dir / "sweep_manifest.json",
-        csv_path=args.output_dir / "sweep_manifest.csv",
-    )
+        historical_runs_dir = protocol_arguments.get(
+            "runs_dir"
+        )
+
+        if historical_runs_dir is None:
+            raise KeyError(
+                "search_protocol.json does not contain "
+                "the historical runs_dir."
+            )
+
+        run_records_dir = Path(
+            str(historical_runs_dir)
+        )
+
+        analysis_arguments = load_analysis_protocol_arguments(
+            args.output_dir
+        )
+
+        manifest_records = load_sweep_manifest(
+            args.output_dir
+        )
+
+    else:
+        run_records_dir = args.runs_dir
+        analysis_arguments = None
+
+        sweep_config = load_sweep_config(
+            args.sweep_config
+        )
+
+        focus_centers = sweep_config[
+            "focus_centers"
+        ]
+
+        minimum_configurations = (
+            len(ANCHOR_CONFIGURATIONS)
+            + len(focus_centers)
+            if args.include_anchors
+            else 0
+        )
+
+        if (
+            args.num_configurations
+            < minimum_configurations
+        ):
+            parser.error(
+                "--num-configurations must be at least "
+                f"{minimum_configurations} "
+                "when anchors are included."
+            )
+
+        if not args.model_seeds:
+            parser.error(
+                "At least one model seed must be provided."
+            )
+
+        if (
+            len(set(args.model_seeds))
+            != len(args.model_seeds)
+        ):
+            parser.error(
+                "--model-seeds must be unique."
+            )
+
+        if (
+            REQUIRED_PARETO_ROLLOUT_HORIZON
+            not in args.rollout_horizons
+        ):
+            parser.error(
+                "The five-metric analysis requires "
+                "rollout horizon "
+                f"{REQUIRED_PARETO_ROLLOUT_HORIZON}."
+            )
+
+        configurations, sampling_plan = generate_configurations(
+            total=args.num_configurations,
+            seed=args.sweep_seed,
+            focus_centers=focus_centers,
+            include_anchors=args.include_anchors,
+        )
+
+        manifest_records = []
+
+        for configuration_id, weights in enumerate(
+            configurations
+        ):
+            for model_seed in args.model_seeds:
+                run_name = (
+                    f"constraint-sweep/"
+                    f"config-{configuration_id:04d}/"
+                    f"seed-{model_seed}"
+                )
+
+                manifest_records.append(
+                    {
+                        "configuration_id": configuration_id,
+                        "run_name": run_name,
+                        "adversary_steps": (
+                            args.adversary_steps
+                        ),
+                        "model_seed": model_seed,
+                        **asdict(weights),
+                    }
+                )
+
+        manifest_path = (
+            args.output_dir
+            / "sweep_manifest.json"
+        )
+
+        if manifest_path.exists():
+            previous_manifest = load_sweep_manifest(
+                args.output_dir
+            )
+
+            if (
+                previous_manifest
+                != manifest_records
+            ):
+                raise ValueError(
+                    "Search manifest differs. "
+                    "Keep the original seeds, bounds, "
+                    "and configuration count, or choose "
+                    "a new output directory."
+                )
+
+        save_records(
+            manifest_records,
+            json_path=manifest_path,
+            csv_path=(
+                args.output_dir
+                / "sweep_manifest.csv"
+            ),
+        )
+
+        save_search_protocol_once(
+            output_dir=args.output_dir,
+            args=args,
+            sampling_plan=sampling_plan,
+            focus_centers=focus_centers,
+        )
 
     if args.dry_run:
         return
@@ -1369,30 +2044,202 @@ def main() -> None:
         dynamic_ncols=True,
     )
 
-    for manifest_record in progress:
-        run_name = str(manifest_record["run_name"])
-        model_seed = int(manifest_record["model_seed"])
-        progress.set_postfix(run=run_name)
+    def finish_run(record, metrics_path, command):
+        if command is not None:
+            run_command(
+                command,
+                title=f"EVALUATING CONFIGURATION {record['configuration_id']} SEED {record['model_seed']}"
+            )
+        return {**record, **load_validation_objectives(metrics_path)}
 
-        weights = SweepWeights(
-            **{
-                name: float(manifest_record[name])
-                for name in WEIGHT_NAMES
-            }
-        )
+    def record_result(record):
+        run_records.append(record)
+        save_records(run_records, json_path=args.output_dir / "sweep_run_results.json",
+                     csv_path=args.output_dir / "sweep_run_results.csv")
 
-        run_dir = args.runs_dir / run_name
-        checkpoint_path = run_dir / "best.pt"
-        metrics_path = (
-            run_dir
-            / "evaluation"
-            / "evaluation_metrics.json"
-        )
+    executor = (
+        ThreadPoolExecutor(max_workers=1)
+        if args.pipeline
+        and not args.analyze_only
+        else None
+    )
 
-        if not args.analyze_only:
-            if not args.skip_existing or not checkpoint_path.exists():
-                run_command(
-                    build_train_command(
+    pending = deque()
+
+    try:
+        for manifest_record in progress:
+            if (
+                args.stop_file is not None
+                and args.stop_file.exists()
+            ):
+                print(
+                    "Stop requested: finishing queued evaluations.",
+                    flush=True,
+                )
+                break
+
+            # At most one evaluation running plus one queued.
+            # Any failure is propagated when the result is collected.
+            while pending and (
+                pending[0].done()
+                or len(pending) >= 2
+            ):
+                completed = pending.popleft().result()
+                record_result(completed)
+
+            run_name = str(manifest_record["run_name"])
+            model_seed = int(manifest_record["model_seed"])
+            progress.set_postfix(run=run_name)
+
+            weights = SweepWeights(
+                **{
+                    name: float(manifest_record[name])
+                    for name in WEIGHT_NAMES
+                }
+            )
+
+            run_dir = run_records_dir / run_name
+            checkpoint_path = run_dir / "best.pt"
+            metrics_path = run_dir / "evaluation" / "evaluation_metrics.json"
+
+            if (
+                not args.analyze_only
+                and args.skip_existing
+                and checkpoint_path.exists()
+            ):
+                saved_config = json.loads(
+                    (run_dir / "config.json").read_text()
+                )
+
+                if (
+                    saved_config["loss"].get("invariance_method")
+                    != INVARIANCE_METHOD
+                ):
+                    raise ValueError(
+                        "Cannot reuse a training run "
+                        f"with a different invariance protocol: {run_dir}"
+                    )
+
+                expected_optimization = {
+                    "epochs": args.epochs,
+                    "batch_size": args.train_batch_size,
+                    "refresh_pretrain_epochs": (args.refresh_pretrain_epochs),
+                    "seed": model_seed,
+                    "adversary_steps": (args.adversary_steps),
+                }
+
+                optimization_differs = any(
+                    saved_config["optimization"].get(name)
+                    != value
+                    for name, value
+                    in expected_optimization.items()
+                )
+
+                if optimization_differs:
+                    raise ValueError(
+                        f"Cached training settings differ: {run_dir}"
+                    )
+
+                expected_weights = {
+                    name: getattr(weights, name)
+                    for name in WEIGHT_NAMES
+                }
+
+                if (saved_config["loss"]["weights"] != expected_weights):
+                    raise ValueError(
+                        f"Cached weights differ: {run_dir}"
+                    )
+
+                manifest = json.loads(
+                    (run_dir / "data_manifest.json").read_text()
+                )
+
+                for split_name in (
+                    "train",
+                    "validation",
+                ):
+                    split_path = args.data_dir / f"{split_name}.npz"
+
+                    digest = hashlib.sha256(split_path.read_bytes()).hexdigest()
+
+                    if manifest.get("sha256", {}).get(split_name) != digest:
+                        raise ValueError(
+                            "Cached dataset differs or is unverified: "
+                            f"{run_dir}"
+                        )
+
+                if metrics_path.exists():
+                    fit_report = json.loads(
+                        (metrics_path.parent / "nuisance_probe_fits.json").read_text()
+                    )
+
+                    saved_evaluation = json.loads(
+                        (metrics_path.parent / "evaluation_protocol.json").read_text()
+                    )
+
+                    desired_evaluation = {
+                        "probe_profile": (args.probe_profile),
+                        "nuisance_probe_epochs": (args.nuisance_probe_epochs),
+                        "strong_probe_epochs": (args.strong_probe_epochs),
+                        "physical_probe_epochs": (args.physical_probe_epochs),
+                        "probe_seed": DEFAULT_PROBE_SEED,
+                        "nonlinear_probe_max_samples": DEFAULT_NONLINEAR_PROBE_MAX_SAMPLES,
+                    }
+
+                    if (saved_evaluation != desired_evaluation):
+                        raise ValueError(
+                            "Cached evaluation settings differ: "
+                            f"{run_dir}"
+                        )
+
+                    if fit_report["settings"]["max_epochs"] != args.nuisance_probe_epochs:
+                        raise ValueError(
+                            "Cached probe budget differs: "
+                            f"{run_dir}"
+                        )
+
+            evaluation_command = None
+
+            if not args.analyze_only:
+                incomplete_run = (
+                    not checkpoint_path.exists()
+                    and run_dir.exists()
+                    and any(run_dir.iterdir())
+                )
+
+                if incomplete_run:
+                    if not args.restart_incomplete:
+                        raise ValueError(
+                            f"Partial training found: {run_dir}. "
+                            "Use --restart-incomplete to archive it "
+                            "and restart this run only."
+                        )
+
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+                    archived_run_dir = run_dir.with_name(
+                        run_dir.name
+                        + ".interrupted-"
+                        + timestamp
+                    )
+
+                    shutil.move(
+                        str(run_dir),
+                        str(archived_run_dir),
+                    )
+
+                    print(
+                        f"Archived incomplete run: {archived_run_dir}",
+                        flush=True,
+                    )
+
+                needs_training = (
+                    not args.skip_existing
+                    or not checkpoint_path.exists()
+                )
+
+                if needs_training:
+                    training_command = build_train_command(
                         train_module=args.train_module,
                         run_name=run_name,
                         runs_dir=args.runs_dir,
@@ -1402,43 +2249,78 @@ def main() -> None:
                         batch_size=args.train_batch_size,
                         device=args.device,
                         weights=weights,
-                    ),
-                    title=(
-                        f"TRAINING CONFIGURATION "
-                        f"{manifest_record['configuration_id']} "
-                        f"SEED {model_seed}"
-                    ),
+                        adversary_steps=args.adversary_steps,
+                        refresh_pretrain_epochs=(
+                            args.refresh_pretrain_epochs
+                        ),
+                    )
+
+                    run_command(
+                        training_command,
+                        title=(
+                            "TRAINING CONFIGURATION "
+                            f"{manifest_record['configuration_id']} "
+                            f"SEED {model_seed}"
+                        ),
+                    )
+
+                needs_evaluation = (
+                    not args.skip_existing
+                    or not metrics_path.exists()
                 )
 
-            if not args.skip_existing or not metrics_path.exists():
-                run_command(
-                    build_evaluation_command(
+                if needs_evaluation:
+                    evaluation_command = build_evaluation_command(
                         checkpoint_path=checkpoint_path,
                         data_dir=args.data_dir,
                         batch_size=args.evaluation_batch_size,
+                        probe_workers=args.probe_workers,
+                        probe_cache_dir=args.probe_cache_dir,
+                        strong_probe_epochs=(
+                            args.strong_probe_epochs
+                        ),
+                        physical_probe_epochs=(
+                            args.physical_probe_epochs
+                        ),
+                        probe_profile=args.probe_profile,
+                        nuisance_probe_epochs=(
+                            args.nuisance_probe_epochs
+                        ),
                         rollout_horizons=args.rollout_horizons,
                         device=args.device,
-                    ),
-                    title=(
-                        f"EVALUATING CONFIGURATION "
-                        f"{manifest_record['configuration_id']} "
-                        f"SEED {model_seed}"
-                    ),
+                    )
+
+            if executor is not None and not args.analyze_only:
+                future = executor.submit(
+                    finish_run,
+                    manifest_record,
+                    metrics_path,
+                    evaluation_command,
                 )
 
-        objectives = load_test_objectives(metrics_path)
-        run_records.append(
-            {
-                **manifest_record,
-                **objectives,
-            }
-        )
+                pending.append(future)
 
-        save_records(
-            run_records,
-            json_path=args.output_dir / "sweep_run_results.json",
-            csv_path=args.output_dir / "sweep_run_results.csv",
-        )
+            else:
+                completed = finish_run(
+                    manifest_record,
+                    metrics_path,
+                    evaluation_command,
+                )
+
+                record_result(completed)
+
+        while pending:
+            completed = pending.popleft().result()
+            record_result(completed)
+
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    if len(run_records) != len(manifest_records):
+        print(f"Stopped cleanly: {len(run_records)}/{len(manifest_records)} results collected. "
+              f"Resume with the same command after removing the stop file.")
+        return
 
     aggregated_records = aggregate_configuration_records(run_records)
 
@@ -1454,13 +2336,41 @@ def main() -> None:
         ),
     )
 
+    if analysis_arguments is not None:
+        absolute_tolerance = float(
+            analysis_arguments["pareto_absolute_tolerance"]
+        )
+
+        relative_tolerance = float(
+            analysis_arguments["pareto_relative_tolerance"]
+        )
+
+        label_minimum_distance = float(
+            analysis_arguments["pareto_label_minimum_distance"]
+        )
+
+    else:
+        absolute_tolerance = (
+            args.pareto_absolute_tolerance
+        )
+
+        relative_tolerance = (
+            args.pareto_relative_tolerance
+        )
+
+        label_minimum_distance = (
+            args.pareto_label_minimum_distance
+        )
+
     figure_paths, summaries, labels = generate_analysis_figures(
         aggregated_records,
         output_dir=args.output_dir / "figures",
-        absolute_tolerance=args.pareto_absolute_tolerance,
-        relative_tolerance=args.pareto_relative_tolerance,
-        outlier_iqr_multiplier=args.plot_outlier_iqr_multiplier,
-        label_minimum_distance=args.pareto_label_minimum_distance,
+        absolute_tolerance=absolute_tolerance,
+        relative_tolerance=relative_tolerance,
+        outlier_iqr_multiplier=(
+            args.plot_outlier_iqr_multiplier
+        ),
+        label_minimum_distance=label_minimum_distance,
     )
 
     save_pareto_summaries(
@@ -1470,9 +2380,10 @@ def main() -> None:
     save_global_pareto_configurations(
         aggregated_records,
         labels,
+        summaries=summaries,
         output_dir=args.output_dir,
     )
-    print_pareto_solutions(summaries)
+    print_representative_pareto_solutions(summaries)
 
     print()
     print_separator()
