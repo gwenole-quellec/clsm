@@ -51,8 +51,6 @@ import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-import pandas as pd
-
 from clsm.training import load_configurations
 from clsm.utils import module_command, print_banner, print_separator
 
@@ -559,62 +557,6 @@ def run_preset_pipeline(
         ),
     )
 
-    # Adversarial dynamics, when the required columns exist
-    history = pd.read_csv(
-        history_path
-    )
-
-    adversarial_columns = {
-        "train_raw_invariance",
-        "validation_raw_invariance",
-        "train_nuisance_adversarial_accuracy",
-        "validation_nuisance_adversarial_accuracy",
-    }
-
-    if adversarial_columns.issubset(
-        history.columns
-    ):
-        adversarial_output = (
-            preset_figures_dir
-            / (
-                f"{preset}_seed-{visualization_seed}_"
-                "adversarial_dynamics.pdf"
-            )
-        )
-
-        adversarial_command = module_command(
-            "scripts.visualization",
-            "adversarial",
-            "--history",
-            str(history_path),
-            "--output",
-            str(adversarial_output),
-        )
-
-        if adversarial_chance_level is not None:
-            adversarial_command.extend(
-                [
-                    "--chance-level",
-                    str(
-                        adversarial_chance_level
-                    ),
-                ]
-            )
-
-        run_command(
-            adversarial_command,
-            title=(
-                f"VISUALIZING ADVERSARIAL DYNAMICS: "
-                f"{preset}-seed-{visualization_seed}"
-            ),
-        )
-    else:
-        print()
-        print(
-            "Skipping adversarial visualization: "
-            "the selected history does not contain all required columns."
-        )
-
     # -------------------------------------------------------------------------
     # Completion report
     # -------------------------------------------------------------------------
@@ -820,3 +762,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
