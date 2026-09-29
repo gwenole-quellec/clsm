@@ -1439,8 +1439,8 @@ def save_pareto_table(
         r"\begin{table}[htbp]",
         r"  \centering",
         (
-            r"  \caption{Constraint weights of representative configurations "
-            r"on the empirical pairwise Pareto fronts. Panel membership refers "
+            r"  \caption{\textbf{Constraint weights of representative configurations "
+            r"on the empirical pairwise Pareto fronts.} Panel membership refers "
             r"to the validation fronts.}"
         ),
         r"  \label{tab:pareto-weights}",
@@ -2406,3 +2406,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

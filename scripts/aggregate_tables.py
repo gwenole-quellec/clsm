@@ -14,16 +14,16 @@ Examples
 --------
 Generate both tables from the final preset evaluation directory:
 
-    python -m scripts.aggregate_tables runs-presets-final
+    python -m scripts.aggregate_tables runs
 
 This writes:
 
-    runs-presets-final/aggregate-table.tex
-    runs-presets-final/aggregate-table.md
+    runs/aggregate-table.tex
+    runs/aggregate-table.md
 
 Custom output paths can also be provided:
 
-    python -m scripts.aggregate_tables runs-presets-final \
+    python -m scripts.aggregate_tables runs \
         --latex-output tables/main-results.tex \
         --markdown-output tables/all-results.md
 """
@@ -723,3 +723,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
