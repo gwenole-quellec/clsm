@@ -45,49 +45,67 @@ PAPER_METRICS = (
     (
         "test",
         "rollout_observation_mse_h5",
-        r"\makecell{Pred. \\ MSE \\ $h=5 \downarrow$}",
+        r"\makecell{Pred. MSE \\ $h=5 \downarrow$}",
         "min",
     ),
     (
         "test",
         "state_probe_r2",
-        r"\makecell{State \\ $R^2 \uparrow$}",
+        r"\makecell{State \\ probe $R^2 \uparrow$}",
         "max",
     ),
     (
         "test",
         "neighborhood_trustworthiness",
-        r"\makecell{Trust. \\ $\uparrow$}",
+        r"\makecell{Trustw. $\uparrow$}",
         "max",
     ),
     (
         "test",
         "counterfactual_relative_energy",
-        r"\makecell{CF \\ energy $\downarrow$}",
+        r"\makecell{CF rel. \\ energy $\downarrow$}",
         "min",
     ),
     (
         "test",
         "nuisance_latent_strong_class_balanced_accuracy",
-        r"\makecell{Nuis. \\ $Z$ \\ BA $\downarrow$}",
+        r"\makecell{Nuis. $Z$ \\ BA $\downarrow$}",
         "min",
     ),
     (
         "test",
         "nuisance_joint_strong_class_balanced_accuracy",
-        r"\makecell{Nuis. \\ $(S,Z)$ \\ BA $\downarrow$}",
+        r"\makecell{Nuis. $(S,Z)$ \\ BA $\downarrow$}",
         "min",
+    ),
+    (
+        "test",
+        "observation_mse",
+        r"\makecell{Obs. recon. \\ MSE $\downarrow$}",
+        "min",
+    ),
+    (
+        "test",
+        "latent_transition_mse",
+        r"\makecell{1-step latent \\ trans. MSE $\downarrow$}",
+        "min",
+    ),
+    (
+        "test",
+        "latent_mean_abs",
+        r"\makecell{Mean $|z|$}",
+        None,
     ),
     (
         "ood",
         "rollout_observation_mse_h5",
-        r"\makecell{OOD \\ pred. MSE \\ $h=5 \downarrow$}",
+        r"\makecell{OOD pred. \\ MSE $h=5 \downarrow$}",
         "min",
     ),
     (
         "ood",
         "state_probe_r2",
-        r"\makecell{OOD \\ state \\ $R^2 \uparrow$}",
+        r"\makecell{OOD state \\ probe $R^2 \uparrow$}",
         "max",
     ),
 )
@@ -330,12 +348,38 @@ def paper_statistic(
 def build_latex_table(
     evaluations: dict[str, dict],
 ) -> str:
-    """Build the compact manuscript table."""
+    """Build the compact manuscript table with two diagnostic panels."""
 
-    column_count = (
-        1
-        + len(PAPER_METRICS)
-    )
+    primary_keys = {
+        ("test", "rollout_observation_mse_h5"),
+        ("test", "state_probe_r2"),
+        ("test", "neighborhood_trustworthiness"),
+        ("test", "counterfactual_relative_energy"),
+        ("test", "nuisance_latent_strong_class_balanced_accuracy"),
+        ("test", "nuisance_joint_strong_class_balanced_accuracy"),
+    }
+
+    primary_metrics = [
+        specification
+        for specification in PAPER_METRICS
+        if (
+            specification[0],
+            specification[1],
+        ) in primary_keys
+    ]
+
+    complementary_metrics = [
+        specification
+        for specification in PAPER_METRICS
+        if (
+            specification[0],
+            specification[1],
+        ) not in primary_keys
+    ]
+
+    # -------------------------------------------------------------------------
+    # Best values for metrics with an optimization direction
+    # -------------------------------------------------------------------------
 
     best_values = {}
 
@@ -392,117 +436,179 @@ def build_latex_table(
                 values
             )
 
+        elif direction is None:
+            best_values[
+                (
+                    split,
+                    metric,
+                )
+            ] = None
+
         else:
             raise ValueError(
                 f"Unknown optimization direction: {direction}"
             )
 
-    lines = [
-        r"\begin{table*}[t]",
-        r"  \centering",
-        r"  \small",
-        r"  \setlength{\tabcolsep}{4pt}",
-        (
-            r"  \begin{tabular}{l"
-            + "c" * (
-                column_count - 1
-            )
-            + "}"
-        ),
-        r"    \toprule",
-    ]
+    # -------------------------------------------------------------------------
+    # Panel renderer
+    # -------------------------------------------------------------------------
 
-    header = (
-        ["Configuration"]
-        + [
-            label
-            for _, _, label, _ in PAPER_METRICS
-        ]
-    )
-
-    lines.append(
-        "    "
-        + " & ".join(
-            header
+    def append_panel(
+        lines: list[str],
+        title: str,
+        metrics,
+    ) -> None:
+        column_count = (
+            1
+            + len(metrics)
         )
-        + r" \\"
-    )
 
-    lines.append(
-        r"    \midrule"
-    )
-
-    for name, aggregate in evaluations.items():
-        row = [
-            name
-        ]
-
-        for (
-            split,
-            metric,
-            _,
-            _,
-        ) in PAPER_METRICS:
-            statistics = paper_statistic(
-                aggregate,
-                split,
-                metric,
-            )
-
-            value = format_mean(
-                statistics,
-                digits=3,
-            )
-
-            mean = (
-                None
-                if statistics is None
-                else statistics.get(
-                    "mean"
-                )
-            )
-
-            best = best_values[
+        lines.extend(
+            [
                 (
-                    split,
-                    metric,
-                )
+                    r"  \begin{tabular}{l"
+                    + "c" * (
+                        column_count - 1
+                    )
+                    + "}"
+                ),
+                r"    \toprule",
+                (
+                    rf"    \multicolumn{{{column_count}}}{{l}}"
+                    rf"{{\textbf{{{title}}}}} \\"
+                ),
+                r"    \midrule",
             ]
+        )
 
-            if (
-                mean is not None
-                and best is not None
-                and float(mean) == best
-            ):
-                value = (
-                    rf"\textbf{{{value}}}"
-                )
-
-            row.append(
-                value
-            )
+        header = (
+            ["Configuration"]
+            + [
+                label
+                for _, _, label, _ in metrics
+            ]
+        )
 
         lines.append(
             "    "
             + " & ".join(
-                row
+                header
             )
             + r" \\"
         )
 
+        lines.append(
+            r"    \midrule"
+        )
+
+        for name, aggregate in evaluations.items():
+            row = [
+                name
+            ]
+
+            for (
+                split,
+                metric,
+                _,
+                _,
+            ) in metrics:
+                statistics = paper_statistic(
+                    aggregate,
+                    split,
+                    metric,
+                )
+
+                value = format_mean(
+                    statistics,
+                    digits=3,
+                )
+
+                mean = (
+                    None
+                    if statistics is None
+                    else statistics.get(
+                        "mean"
+                    )
+                )
+
+                best = best_values[
+                    (
+                        split,
+                        metric,
+                    )
+                ]
+
+                if (
+                    mean is not None
+                    and best is not None
+                    and float(mean) == best
+                ):
+                    value = (
+                        rf"\textbf{{{value}}}"
+                    )
+
+                row.append(
+                    value
+                )
+
+            lines.append(
+                "    "
+                + " & ".join(
+                    row
+                )
+                + r" \\"
+            )
+
+        lines.extend(
+            [
+                r"    \bottomrule",
+                r"  \end{tabular}",
+            ]
+        )
+
+    # -------------------------------------------------------------------------
+    # Complete table
+    # -------------------------------------------------------------------------
+
+    lines = [
+        r"\begin{table*}[!t]",
+        r"  \centering",
+        r"  \small",
+        r"  \renewcommand{\arraystretch}{0.88}",
+        r"  \setlength{\tabcolsep}{4pt}",
+    ]
+
     lines.extend(
         [
-            r"    \bottomrule",
-            r"  \end{tabular}",
             r"  \caption{",
             r"    \textbf{Performance of the selected CLSM configurations.}",
-            r"    Values are means across model seeds. Best values in each column are shown in bold.",
+            r"    Values are means across model seeds. Best values are shown in bold for metrics with a defined optimization direction. Mean absolute latent activation is reported descriptively as a diagnostic associated with the $\ell_1$ minimality surrogate and is not interpreted as a direct measure of information-theoretic minimality. CF: counterfactual; BA: balanced accuracy; OOD: out-of-distribution; Trustw.: trustworthiness.",
             r"  }",
             r"  \label{tab:clsm-main-results}",
-            r"\end{table*}",
-            "",
         ]
     )
+
+    append_panel(
+        lines,
+        "A. Primary evaluation diagnostics",
+        primary_metrics,
+    )
+
+    lines.extend(
+        [
+            r"",
+            r"  \vspace{0.75em}",
+            r"",
+        ]
+    )
+
+    append_panel(
+        lines,
+        "B. Complementary evaluation diagnostics",
+        complementary_metrics,
+    )
+
+    lines.append(r"\end{table*}")
 
     return "\n".join(
         lines
