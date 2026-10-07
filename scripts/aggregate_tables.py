@@ -45,19 +45,19 @@ PAPER_METRICS = (
     (
         "test",
         "rollout_observation_mse_h5",
-        r"\makecell{Pred. MSE \\ $h=5 \downarrow$}",
+        r"\makecell{Raw-obs. Pred. \\ MSE $h=5 \downarrow$}",
         "min",
     ),
     (
         "test",
         "state_probe_r2",
-        r"\makecell{State \\ probe $R^2 \uparrow$}",
+        r"\makecell{Linear \\ state $R^2 \uparrow$}",
         "max",
     ),
     (
         "test",
         "neighborhood_trustworthiness",
-        r"\makecell{Trustw. $\uparrow$}",
+        r"\makecell{Neigh. \\ Trust. $\uparrow$}",
         "max",
     ),
     (
@@ -99,13 +99,13 @@ PAPER_METRICS = (
     (
         "ood",
         "rollout_observation_mse_h5",
-        r"\makecell{OOD pred. \\ MSE $h=5 \downarrow$}",
+        r"\makecell{OOD raw-obs. \\ pred. MSE $h=5 \downarrow$}",
         "min",
     ),
     (
         "ood",
         "state_probe_r2",
-        r"\makecell{OOD state \\ probe $R^2 \uparrow$}",
+        r"\makecell{OOD linear \\ state $R^2 \uparrow$}",
         "max",
     ),
 )
@@ -582,7 +582,7 @@ def build_latex_table(
         [
             r"  \caption{",
             r"    \textbf{Performance of the selected CLSM configurations.}",
-            r"    Values are means across model seeds. Best values are shown in bold for metrics with a defined optimization direction. Mean absolute latent activation is reported descriptively as a diagnostic associated with the $\ell_1$ minimality surrogate and is not interpreted as a direct measure of information-theoretic minimality. CF: counterfactual; BA: balanced accuracy; OOD: out-of-distribution; Trustw.: trustworthiness.",
+            r"    Values are means across model seeds. Best values are shown in bold for metrics with a defined optimization direction. Mean absolute latent activation is reported descriptively as a diagnostic associated with the $\ell_1$ minimality surrogate and is not interpreted as a direct measure of information-theoretic minimality. CF: counterfactual; BA: balanced accuracy; OOD: out-of-distribution.",
             r"  }",
             r"  \label{tab:clsm-main-results}",
         ]
@@ -590,7 +590,7 @@ def build_latex_table(
 
     append_panel(
         lines,
-        "A. Primary evaluation diagnostics",
+        "A. Main evaluation diagnostics",
         primary_metrics,
     )
 

@@ -153,11 +153,11 @@ OBJECTIVES = {
 }
 
 OBJECTIVE_LABELS = {
-    "rollout_observation_mse_h5": "Prediction MSE (h=5) ↓",
-    "state_probe_r2": r"State accessibility ($R^2$) ↑",
-    "neighborhood_trustworthiness": "Neighborhood preservation ↑",
+    "rollout_observation_mse_h5": "Raw-observation prediction MSE (h=5) ↓",
+    "state_probe_r2": r"Linear state $R^2$ ↑",
+    "neighborhood_trustworthiness": "Neighborhood trustworthiness ↑",
     "counterfactual_relative_energy": "Counterfactual relative energy ↓",
-    "nuisance_latent_strong_class_balanced_accuracy": "Nuisance balanced accuracy ↓",
+    "nuisance_latent_strong_class_balanced_accuracy": r"Nuisance $Z$ balanced accuracy ↓",
 }
 
 OBJECTIVE_SHORT_NAMES = {
