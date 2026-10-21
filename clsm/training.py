@@ -161,6 +161,9 @@ class LossConfig:
 
     predictive_horizon_decay: float = 1.0
 
+    # None means all observation channels (standard benchmark behaviour).
+    target_channels: tuple[int, ...] | None = None
+
     structural_variance_target: float = 1.0
     structural_variance_weight: float = 1.0
     structural_covariance_weight: float = 1.0
@@ -576,10 +579,25 @@ def compute_loss_components(
     components: dict[str, Tensor] = {}
     diagnostics: dict[str, Tensor] = {}
 
+    channels = loss_config.target_channels
+    if channels is not None:
+        if (not channels or len(set(channels)) != len(channels)
+                or any(i < 0 or i >= observation.shape[-1] for i in channels)):
+            raise ValueError(
+                f"Invalid target_channels={channels!r} for "
+                f"observation_dim={observation.shape[-1]}."
+            )
+        target_observation = observation[..., list(channels)]
+    else:
+        target_observation = observation
+
     if weights.observation > 0:
+        reconstruction = output["reconstructed_observation"]
+        if channels is not None:
+            reconstruction = reconstruction[..., list(channels)]
         components["observation"] = observation_compatibility_loss(
-            output["reconstructed_observation"],
-            observation,
+            reconstruction,
+            target_observation,
             loss_type=loss_config.reconstruction_loss_type,
         )
 
@@ -594,6 +612,9 @@ def compute_loss_components(
             horizons=loss_config.predictive_horizons,
         )
 
+        if channels is not None:
+            predicted_future_observation = predicted_future_observation[..., list(channels)]
+            target_future_observation = target_future_observation[..., list(channels)]
         horizon_weights = torch.tensor(
             [
                 loss_config.predictive_horizon_decay ** horizon_index
@@ -1525,6 +1546,14 @@ def add_training_arguments(
         ),
         default="dynamics",
     )
+    parser.add_argument(
+        "--target-channels",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Zero-based observation channels used as prediction and reconstruction targets; "
+             "defaults to all channels. The encoder always receives the full observation.",
+    )
 
 
 def config_from_args(
@@ -1557,6 +1586,7 @@ def config_from_args(
         weights=weights,
         minimality_mode=args.minimality_mode,
         temporal_mode=args.temporal_mode,
+        target_channels=None if args.target_channels is None else tuple(args.target_channels),
     )
 
     return TrainConfig(

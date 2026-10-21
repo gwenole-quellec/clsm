@@ -4,8 +4,8 @@ Independent post-hoc probes for CLSM evaluation.
 Author: Gwenolé Quellec
 Year: 2026
 
-Feature scaling is fit on the training split only. Nonlinear probe
-selection uses the external validation split.
+Feature scaling is fit on the training split only. Nonlinear probe selection
+uses the external validation split.
 """
 
 import copy

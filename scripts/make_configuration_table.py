@@ -14,7 +14,7 @@ Examples
 --------
 Generate both tables from the final preset evaluation directory:
 
-    python -m scripts.aggregate_tables runs
+    python -m scripts.make_configuration_table runs
 
 This writes:
 
@@ -23,7 +23,7 @@ This writes:
 
 Custom output paths can also be provided:
 
-    python -m scripts.aggregate_tables runs \
+    python -m scripts.make_configuration_table runs \
         --latex-output tables/main-results.tex \
         --markdown-output tables/all-results.md
 """

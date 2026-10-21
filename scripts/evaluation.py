@@ -40,7 +40,7 @@ import platform
 import uuid
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -2168,6 +2168,242 @@ def evaluate_splits(
 
 
 # =============================================================================
+# Post-hoc nuisance-probe sensitivity controls
+# =============================================================================
+
+def evaluate_probe_controls(
+    model: CLSMModel,
+    splits: DatasetSplits,
+    config: EvaluationConfig,
+    levels: Sequence[float],
+    *,
+    conditional_latent_only: bool = False,
+) -> dict[str, MetricDict]:
+    """Calibrate strong nuisance probes using synthetic nuisance leakage.
+
+    With conditional_latent_only, fit only Z-only probes for the state-modulated
+    positive control; this avoids refitting the existing (S,Z) controls.
+    """
+    device = next(model.parameters()).device
+    datasets = {
+        name: encode_dataset(
+            model, dataset,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            device=device,
+        )
+        for name, dataset in (
+            ("train", splits.train),
+            ("validation", splits.validation),
+            ("test", splits.test),
+        )
+    }
+    train = datasets["train"]
+    classes = np.unique(train.nuisance_id)
+    if len(classes) < 2:
+        raise ValueError("Probe controls require at least two nuisance classes.")
+
+    # A single codebook and latent scale are fitted on TRAIN only.
+    rng = np.random.default_rng(config.probe_seed + 2026)
+    codebook = rng.standard_normal((len(classes), train.latent_dim))
+    codebook -= codebook.mean(axis=0, keepdims=True)
+    codebook /= max(float(np.sqrt(np.mean(codebook**2))), 1e-12)
+    latent_scale = np.std(train.latent.reshape(-1, train.latent_dim), axis=0)
+    latent_scale = np.maximum(latent_scale, 1e-6)
+    state_median = np.median(train.true_state.reshape(-1, train.state_dim), axis=0)
+    state_axes = np.arange(train.latent_dim) % train.state_dim
+
+    # The pareto profile fits the existing 64-64 strong classifier for its
+    # 'latent' view. Supply Z, S, or (S,Z) as that feature array.
+    control_config = replace(
+        config, probe_profile="pareto", probe_workers=1, output_dir=None
+    )
+
+    def strong_score(encoded: dict[str, EncodedDataset], view: str) -> tuple[float, float]:
+        if view not in ("latent", "state", "joint"):
+            raise ValueError(f"Unknown control probe view: {view}")
+        features = {
+            name: replace(
+                data,
+                latent=(
+                    data.latent if view == "latent"
+                    else data.true_state if view == "state"
+                    else np.concatenate((data.true_state, data.latent), axis=-1)
+                ),
+            )
+            for name, data in encoded.items()
+        }
+        audit = NuisanceAudit(features["train"], features["validation"], control_config)
+        metrics = audit.score(features["test"])
+        return (
+            float(metrics["nuisance_latent_strong_class_balanced_accuracy"]),
+            float(metrics["nuisance_latent_strong_class_log_loss"]),
+        )
+
+    if not conditional_latent_only:
+        state_ba, state_log_loss = strong_score(datasets, "state")
+
+    def record(encoded: dict[str, EncodedDataset], alpha: float) -> MetricDict:
+        joint_ba, joint_log_loss = strong_score(encoded, "joint")
+        return {
+            "control_level": alpha,
+            "nuisance_probe_chance": 1.0 / len(classes),
+            "nuisance_state_strong_class_balanced_accuracy": state_ba,
+            "nuisance_state_strong_class_log_loss": state_log_loss,
+            "nuisance_joint_strong_class_balanced_accuracy": joint_ba,
+            "nuisance_joint_strong_class_log_loss": joint_log_loss,
+            "nuisance_joint_over_state_strong_balanced_accuracy_gain": joint_ba - state_ba,
+            "nuisance_joint_over_state_strong_log_loss_reduction": state_log_loss - joint_log_loss,
+        }
+
+    results = {} if conditional_latent_only else {"baseline": record(datasets, 0.0)}
+    conditions = (
+        ("conditional_positive",)
+        if conditional_latent_only
+        else ("positive", "conditional_positive", "negative")
+    )
+    for alpha in levels:
+        for condition in conditions:
+            modified = {}
+            for split_number, (name, data) in enumerate(datasets.items()):
+                labels = np.asarray(data.nuisance_id).reshape(-1)
+                if len(labels) != data.n_episodes or not np.isin(labels, classes).all():
+                    raise ValueError(f"Unexpected nuisance labels in {name} split.")
+                if condition == "negative":
+                    # One independent permutation per split, fixed across alpha.
+                    labels = np.random.default_rng(
+                        config.probe_seed + 3000 + split_number
+                    ).permutation(labels)
+                class_indices = np.searchsorted(classes, labels)
+                signal = codebook[class_indices, None, :] * latent_scale
+                if condition == "conditional_positive":
+                    # Diagonal orthogonal transform Q(S): coordinate-wise sign flips.
+                    signs = np.where(
+                        data.true_state[..., state_axes] >= state_median[state_axes],
+                        1.0, -1.0,
+                    )
+                    signal = signal * signs
+                modified[name] = replace(data, latent=data.latent + alpha * signal)
+            if conditional_latent_only:
+                latent_ba, latent_log_loss = strong_score(modified, "latent")
+                results[f"{condition}_{alpha:g}"] = {
+                    "control_level": float(alpha),
+                    "nuisance_latent_strong_class_balanced_accuracy": latent_ba,
+                    "nuisance_latent_strong_class_log_loss": latent_log_loss,
+                }
+            else:
+                results[f"{condition}_{alpha:g}"] = record(modified, float(alpha))
+ 
+    return results
+
+
+def save_probe_control_figure(
+    aggregated: Mapping[str, Mapping[str, Mapping[str, MetricValue]]],
+    output_dir: Path,
+    *,
+    conditional_latent: Mapping[str, Mapping[str, Mapping[str, MetricValue]]] | None = None,
+) -> tuple[Path, Path]:
+    """Plot mean +/- sample SD across training seeds, from aggregated controls."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # Headless SSH runs.
+    import matplotlib.pyplot as plt
+
+    conditions = (
+        ("positive", "Positive", "o"),
+        ("conditional_positive", "State-conditioned positive", "s"),
+        ("negative", "Negative (permuted)", "^"),
+    )
+    metrics = (
+        "nuisance_joint_strong_class_balanced_accuracy",
+        "nuisance_joint_over_state_strong_log_loss_reduction",
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(8.0, 3.5))
+    all_levels = set()
+
+    for name, label, marker in conditions:
+        observations = sorted(
+            (
+                (float(values["control_level"]["mean"]), values)
+                for key, values in aggregated.items()
+                if key.startswith(name + "_")
+            ),
+            key=lambda item: item[0],
+        )
+        if not observations or any(level <= 0 for level, _ in observations):
+            raise ValueError(f"Missing or invalid probe controls: {name}")
+        levels = [level for level, _ in observations]
+        all_levels.update(levels)
+        for ax, metric in zip(axes, metrics):
+            scale = 100.0 if metric.endswith("balanced_accuracy") else 1.0
+            ax.errorbar(
+                levels,
+                [float(row[metric]["mean"]) * scale for _, row in observations],
+                yerr=[float(row[metric]["std"]) * scale for _, row in observations],
+                label=label,
+                marker=marker,
+                linewidth=1.5,
+                markersize=4.5,
+                capsize=2,
+            )
+
+    for ax, panel in zip(axes, ("(a)", "(b)")):
+        ax.set_xscale("log")
+        ticks = sorted(all_levels)
+        ax.set_xticks(ticks, labels=[f"{level:g}" for level in ticks])
+        ax.minorticks_off()
+        ax.set_xlabel(r"Injection strength $\alpha$" + f"\n{panel}")
+        ax.grid(alpha=0.18)
+
+    chance = aggregated["baseline"]["nuisance_probe_chance"]["mean"]
+    axes[0].axhline(float(chance) * 100, color="0.45", linestyle=":", linewidth=1)
+    axes[0].set_ylabel("Nuisance balanced accuracy (%)")
+    axes[0].set_ylim(20, 105)
+    if conditional_latent is not None:
+        extra = sorted(
+            (
+                (float(row["control_level"]["mean"]), row)
+                for key, row in conditional_latent.items()
+                if key.startswith("conditional_positive_")
+            ),
+            key=lambda item: item[0],
+        )
+        expected = sorted(
+            float(row["control_level"]["mean"])
+            for key, row in aggregated.items()
+            if key.startswith("conditional_positive_")
+        )
+        if [level for level, _ in extra] != expected:
+            raise ValueError("Z-only and joint conditional controls have different strengths.")
+        metric = "nuisance_latent_strong_class_balanced_accuracy"
+        axes[0].errorbar(
+            [level for level, _ in extra],
+            [float(row[metric]["mean"]) * 100 for _, row in extra],
+            yerr=[float(row[metric]["std"]) * 100 for _, row in extra],
+            label=r"State-conditioned positive ($Z$ only)",
+            color="C1",
+            linestyle="--",
+            marker="D",
+            markersize=4,
+            linewidth=1.5,
+            capsize=2,
+        )
+    axes[0].legend(loc="upper left", fontsize=8, frameon=False)
+    axes[1].axhline(0, color="0.45", linestyle=":", linewidth=1)
+    axes[1].set_ylabel("Joint-over-state log-loss reduction (nats)")
+    fig.tight_layout(w_pad=2.0)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf = output_dir / "fig_probe_controls.pdf"
+    png = output_dir / "fig_probe_controls.png"
+    fig.savefig(pdf, bbox_inches="tight")
+    fig.savefig(png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return pdf, png
+
+
+# =============================================================================
 # Evaluation artifact serialization
 # =============================================================================
 
@@ -2644,7 +2880,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--data-dir",
-        required=True,
+        default=None,
     )
 
     parser.add_argument(
@@ -2790,6 +3026,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--probe-controls",
+        action="store_true",
+        help="Run strong nuisance-probe sensitivity controls only (ID test).",
+    )
+    parser.add_argument(
+        "--plot-probe-controls",
+        metavar="AGGREGATE_JSON",
+        help="Create PDF/PNG from an existing probe-control aggregate, without re-evaluation.",
+    )
+    parser.add_argument(
+        "--conditional-latent-only",
+        action="store_true",
+        help="With --probe-controls, fit only Z-only state-conditioned controls.",
+    )
+    parser.add_argument(
+        "--conditional-latent-aggregate",
+        metavar="AGGREGATE_JSON",
+        help="With --plot-probe-controls, overlay Z-only state-conditioned results.",
+    )
+    parser.add_argument(
+        "--control-levels",
+        type=float,
+        nargs="+",
+        default=[0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0],
+        help="Positive injection strengths; alpha=0 is included automatically.",
+    )
     return parser
 
 
@@ -2879,6 +3142,19 @@ def evaluate_one_checkpoint(
             output_dir
         ),
     )
+
+    if args.probe_controls:
+        results = evaluate_probe_controls(
+            model, splits, config, args.control_levels,
+            conditional_latent_only=args.conditional_latent_only,
+        )
+        stem = (
+            "probe_controls_conditional_latent"
+            if args.conditional_latent_only else "probe_controls"
+        )
+        save_results_json(results, output_dir / f"{stem}.json")
+        save_results_csv(results, output_dir / f"{stem}.csv")
+        return results
 
     evaluation_protocol = {
         "probe_profile": config.probe_profile,
@@ -3020,6 +3296,31 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.plot_probe_controls is not None:
+        if args.probe_controls or args.conditional_latent_only:
+            parser.error("--plot-probe-controls cannot be combined with probe fitting.")
+        source = Path(args.plot_probe_controls)
+        with source.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+        additional = None
+        if args.conditional_latent_aggregate is not None:
+            with Path(args.conditional_latent_aggregate).open(encoding="utf-8") as stream:
+                additional = json.load(stream)["aggregate"]
+        destination = Path(args.output_dir) if args.output_dir else source.parent
+        pdf, png = save_probe_control_figure(
+            payload["aggregate"], destination, conditional_latent=additional,
+        )
+        print(f"Probe-control figure saved to: {pdf} and {png}")
+        return
+
+    if args.conditional_latent_only and not args.probe_controls:
+        parser.error("--conditional-latent-only requires --probe-controls.")
+    if args.conditional_latent_aggregate is not None:
+        parser.error("--conditional-latent-aggregate requires --plot-probe-controls.")
+
+    if args.data_dir is None:
+        parser.error("--data-dir is required unless --plot-probe-controls is used.")
+
     try:
         seeds = resolve_evaluation_seeds(
             args
@@ -3028,6 +3329,14 @@ def main() -> None:
         parser.error(
             str(error)
         )
+
+    if args.probe_controls:
+        if args.split != "test":
+            parser.error("--probe-controls requires --split test.")
+        if len(set(args.control_levels)) != len(args.control_levels) or any(
+            not np.isfinite(level) or level <= 0 for level in args.control_levels
+        ):
+            parser.error("--control-levels must be distinct, finite, positive numbers.")
 
     device = resolve_device(
         args.device
@@ -3165,6 +3474,21 @@ def main() -> None:
             "Aggregated metrics saved to: "
             f"{aggregate_path}"
         )
+
+        if args.probe_controls:
+            metric_name = (
+                "nuisance_latent_strong_class_balanced_accuracy"
+                if args.conditional_latent_only
+                else "nuisance_joint_strong_class_balanced_accuracy"
+            )
+            if not args.conditional_latent_only:
+                pdf, png = save_probe_control_figure(aggregated, aggregate_path.parent)
+                print(f"Probe-control figure saved to: {pdf} and {png}")
+            print("Probe-control aggregate:")
+            for condition, metrics in aggregated.items():
+                score = metrics[metric_name]
+                print(f"  {condition:<27} {score['mean']:.4f} ± {score['std']:.4f}")
+            return
 
         selected_metrics = (
             "observation_mse",
