@@ -1,11 +1,11 @@
 """
-Rotational identifiability analysis for CLSM-Toy.
+Rotational identifiability analysis.
 
 Author: Gwenolé Quellec
 Year: 2026
 
 This module illustrates latent reparameterization ambiguities using a trained
-CLSM-Toy model. It does not retrain the network.
+model. It does not retrain the network.
 
 Analysis principles
 -------------------
@@ -21,7 +21,10 @@ original latent codes supplies an orthonormal rotation basis. For panels A and
 B, the publication projection is fitted by StandardScaler + PCA on the saved
 original and counterfactual codes, exactly as in scripts.visualization.
 
-Run from the repository root::
+Examples
+--------
+
+Assessing identifiability for a trained configuration (e.g., P29, seed 0):
 
     python -m scripts.evaluate_identifiability \\
         --checkpoint runs/P29-seed-0/best.pt \\
@@ -30,12 +33,11 @@ Run from the repository root::
         --output-dir identifiability/P29-seed-0 \\
         --device cuda
 
-The default sweep covers 0--360 degrees in 5-degree increments. The example
-in panel B uses a 60-degree rotation in the *raw four-dimensional latent
-space*. The displayed projection is not itself rotated by 60 degrees.
-
-Only load checkpoints from trusted sources. This experiment demonstrates
-coordinate ambiguity, not identifiability of the underlying physical state.
+The default sweep covers 0-360 degrees in 5-degree increments. The example
+in panel B uses a 60-degree rotation in the raw four-dimensional latent
+space. The displayed projection is not itself rotated by 60 degrees. This
+experiment demonstrates coordinate ambiguity, not identifiability of the
+underlying physical state.
 """
 
 from __future__ import annotations

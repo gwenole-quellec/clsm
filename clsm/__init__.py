@@ -8,4 +8,4 @@ A lightweight framework for learning constrained latent state representations
 from sequential observations.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

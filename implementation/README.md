@@ -24,23 +24,32 @@ clsm/
     losses.py
     models.py
     nuisance_probes.py
+    protocols.py
     refresh.py
     strong_adversary.py
     training.py
     utils.py
 
 toy/
+    configurations.json
+    constraint_sweep_config.json
     environment.py
     metadata.json
+    observable_target_control.py
     train.py
-    constraint_sweep_config.json
-    configurations.json
 
 scripts/
     constraint_sweep.py
+    evaluate_identifiability.py
     evaluation.py
+    make_configuration_table.py
     run_presets.py
     visualization.py
+
+supplement/
+    evaluate_pareto_stability.py
+    evaluate_seed_alignment.py
+    make_target_ablation_table.py
 ```
 
 The main responsibilities are:

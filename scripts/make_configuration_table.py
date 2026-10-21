@@ -1,5 +1,6 @@
 """
-Build paper and exhaustive tables from aggregate CLSM evaluations.
+Generate summary and exhaustive tables of evaluation metrics for multiple CLSM
+configurations.
 
 Author: Gwenolé Quellec
 Year: 2026

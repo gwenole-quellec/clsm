@@ -24,14 +24,15 @@ folder. ``--source runs`` instead reads each run's ``evaluation_metrics.json``
 from the training folder. In both cases, the original analysis folder is used
 for protocol and aggregate-result consistency checks.
 
-Run from the repository root::
+Example
+-------
+
+Evaluate Pareto front stability from saved constraint sweep artifacts:
 
     python -m scripts.evaluate_pareto_stability \\
         --runs-dir runs-weight-sweep-final \\
         --analysis-dir analysis-weight-sweep-final \\
         --output-dir analysis-pareto-stability
-
-No training, GPU, or additional model evaluation is required.
 """
 
 from __future__ import annotations

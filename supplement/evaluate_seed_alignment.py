@@ -1,5 +1,5 @@
 """
-Alignment of independently learned latent spaces for CLSM-Toy.
+Alignment of independently learned latent spaces.
 
 Author: Gwenolé Quellec
 Year: 2026
@@ -26,7 +26,8 @@ positive scaling factor, but not arbitrary shearing or nonlinear warping.
 A small residual is evidence of *empirical reproducibility* up to the chosen
 transformation class, not a mathematical proof of latent identifiability.
 
-Run from the repository root::
+Example
+-------
 
     python -m scripts.evaluate_seed_alignment \\
         --runs-dir runs \\
@@ -34,8 +35,6 @@ Run from the repository root::
         --seeds 0 1 2 3 4 \\
         --reference-seed 0 \\
         --output-dir identifiability/P29-seed-alignment
-
-No checkpoints, GPUs, or retraining are required.
 """
 
 from __future__ import annotations

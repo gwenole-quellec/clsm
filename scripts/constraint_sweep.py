@@ -1414,7 +1414,7 @@ def save_pareto_table(
     rows: Sequence[Mapping[str, object]],
     output_dir: Path,
 ) -> None:
-    """Export Table 4 with the same P labels and panel memberships as the figures."""
+    """Export configuration table with the same P labels and panel memberships as the figures."""
 
     headers = [
         "Configuration",
@@ -1423,7 +1423,7 @@ def save_pareto_table(
     ]
 
     markdown_lines = [
-        "# Table 4 — Representative pairwise Pareto configurations",
+        "# Representative pairwise Pareto configurations",
         "",
         (
             "Weights of configurations labeled in the four panels. "
@@ -2406,4 +2406,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

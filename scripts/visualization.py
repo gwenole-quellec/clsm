@@ -1,11 +1,11 @@
 """
-Visualization utilities for CLSM-Toy.
+Visualization utilities for CLSM.
 
 Author: Gwenolé Quellec
 Year: 2026
 
 This module produces publication-oriented and diagnostic visualizations for
-CLSM-Toy experiments.
+CLSM experiments.
 
 Visualization principles
 ------------------------
