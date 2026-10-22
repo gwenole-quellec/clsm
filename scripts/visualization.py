@@ -84,6 +84,15 @@ CCA_MODERATE_REFERENCE = 0.5
 
 HEATMAP_TEXT_CONTRAST_THRESHOLD = 0.55
 
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
 
 # =============================================================================
 # Visualization data structure
@@ -1555,7 +1564,6 @@ def create_state_analysis_figure(
                         > HEATMAP_TEXT_CONTRAST_THRESHOLD * maximum
                         else "black"
                     ),
-                    fontsize=8,
                 )
 
         figure.colorbar(

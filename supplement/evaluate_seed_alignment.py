@@ -83,6 +83,15 @@ DEFAULT_MAX_ERROR = 1e-6
 NORMALIZATION_EPSILON = 1e-12
 ALIGNMENT_MODES = ("orthogonal", "similarity")
 
+plt.rcParams.update({
+    "font.size": 13,
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+})
+
 
 # =============================================================================
 # Analysis data structures
@@ -883,14 +892,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """Compute transformations and write the full held-out evaluation."""
     args = build_arg_parser().parse_args()
-    plt.rcParams.update({
-        "font.size": 13,
-        "axes.titlesize": 16,
-        "axes.labelsize": 14,
-        "xtick.labelsize": 12,
-        "ytick.labelsize": 12,
-        "legend.fontsize": 12,
-    })
 
     seeds = tuple(args.seeds)
     if len(seeds) < 2 or len(set(seeds)) != len(seeds):

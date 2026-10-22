@@ -207,6 +207,15 @@ ANCHOR_CONFIGURATIONS = (
       for value in (0.0, 0.1, 0.3, 1.0, 3.0, 5.0, 10.0)),
 )
 
+plt.rcParams.update({
+    "font.size": 9,
+    "axes.titlesize": 16,
+    "axes.labelsize": 14,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+})
+
 
 # =============================================================================
 # Weight sampling
@@ -1206,7 +1215,6 @@ def plot_pairwise_pareto(
                 x_values[index],
                 y_values[index],
                 labels[configuration_id],
-                fontsize=8,
                 fontweight="bold",
                 ha="center",
                 va="center",

@@ -95,6 +95,15 @@ DEFAULT_RELATIVE_MSE_TOLERANCE = 1e-4
 STRUCTURAL_VARIANCE_EPSILON = 1e-4
 NORMALIZATION_EPSILON = 1e-12
 
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
 
 # =============================================================================
 # Result data structures
@@ -921,9 +930,7 @@ def plot_invariant_losses(
     axis.set_xticks(
         np.arange(0, angles[-1] + 1, 60)
     )
-    axis.legend(
-        fontsize=8
-    )
+    axis.legend()
 
 
 def plot_coordinate_penalties(
@@ -983,9 +990,7 @@ def plot_coordinate_penalties(
     axis.set_xticks(
         np.arange(0, angles[-1] + 1, 60)
     )
-    axis.legend(
-        fontsize=8
-    )
+    axis.legend()
 
 
 def create_identifiability_figure(

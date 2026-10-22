@@ -1,10 +1,18 @@
 """Generate a reproducible target-selection/invariance ablation table.
 
-The requested configuration supplies the original 12-target checkpoints and
-its six-target variants, with and without adversarial invariance. All displayed
-statistics are recalculated from five individual training seeds.
+Compare the original full-target configuration with its reduced-target
+variants, with and without adversarial invariance. All displayed statistics are
+recalculated from five individual training seeds.
 
-Example (from the CLSM repository root)::
+Scope
+-----
+This script implements the target-selection ablation protocol of the CLSM-Toy
+benchmark (12 input channels, 6 prediction targets). It supports different
+configurations within this benchmark but is not intended as a general-purpose
+ablation tool for other datasets.
+
+Example
+-------
 
     python -m scripts.make_target_ablation_table \\
         --configuration CONFIG_ID \\
