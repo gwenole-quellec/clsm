@@ -146,22 +146,18 @@ selected pairwise Pareto fronts from five representation-level metrics.
 
 ## Paper
 
-If you use CLSM in your research, please cite:
+**What competing constraints reveal about representation learning**
 
-**Constrained latent state modeling: A unifying perspective on representation
-learning under competing constraints**
+Accepted for publication in Patterns (Cell Press), 2026.
 
-Preprint available on arXiv: [arXiv:2605.15995](https://arxiv.org/abs/2605.15995)
+An earlier version is available on arXiv: [arXiv:2605.15995](https://arxiv.org/abs/2605.15995)
 
 ```bibtex
-@misc{quellec2026clsm,
-  title={Constrained latent state modeling: A unifying perspective on representation learning under competing constraints},
-  author={Gwenol\'e Quellec},
-  year={2026},
-  eprint={2605.15995},
-  archivePrefix={arXiv},
-  primaryClass={cs.LG},
-  url={https://arxiv.org/abs/2605.15995}
+@article{quellec2027competingconstraints,
+  title={What competing constraints reveal about representation learning},
+  author={Quellec, Gwenol\'e},
+  journal={Patterns},
+  note={In press}
 }
 ```
 
