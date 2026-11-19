@@ -147,9 +147,7 @@ The sweep evaluates a finite set of training configurations on the validation sp
 
 Accepted for publication in Patterns (Cell Press), 2026.
 
-An earlier version is available on arXiv: [arXiv:2605.15995](https://arxiv.org/abs/2605.15995)
-
-The arXiv PDF corresponds to an earlier version of the manuscript and does not incorporate all revisions made during subsequent rounds of peer review.
+The accepted manuscript is available on arXiv: [arXiv:2605.15995](https://arxiv.org/abs/2605.15995)
 
 The recommended citation is:
 
